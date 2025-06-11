@@ -1,0 +1,14 @@
+[Unit]
+Description=RPBot Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=Ya1chko
+WorkingDirectory=/RPBOT3/RRBOT/RP BOT 3.5/RPBOT/Python files
+ExecStart=/RPBOT3/RRBOT/RP BOT 3.5/RPBOT/Python files/start_bot.sh
+Restart=always
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

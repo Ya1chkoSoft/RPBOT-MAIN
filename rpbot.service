@@ -4,9 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=Ya1chko
-WorkingDirectory=/RPBOT3/RRBOT/RP BOT 3.5/RPBOT/Python files
-ExecStart=/RPBOT3/RRBOT/RP BOT 3.5/RPBOT/Python files/start_bot.sh
+# Убедитесь, что этот пользователь есть в системе:
+User=ya1chko
+# Лучше без пробелов в пути:
+# /RPBOT3/RRBOT/RPBOT3_5/RPBOT/python_files
+WorkingDirectory=/RPBOT3/RRBOT/RPBOT3_5/RPBOT/python_files
+# Запускаем через bash, чтобы было совсем надёжно
+ExecStart=/bin/bash -lc './start_bot.sh'
 Restart=always
 Environment=PYTHONUNBUFFERED=1
 

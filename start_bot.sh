@@ -2,7 +2,7 @@
 # start_bot.sh — должен лежать в /root/RPBOT-MAIN
 
 # 1) Переходим в каталог с ботом
-cd "/root/RPBOT-MAIN/Python files"
+cd "/root/RPBOT-MAIN/python-files"
 
 source ../.venv/bin/activate 
 

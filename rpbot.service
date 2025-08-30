@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/RPBOT-MAIN/Python files
+WorkingDirectory=/root/RPBOT-MAIN/python-files
 # Запускаем bash в этом каталоге, чтобы source и относительные пути работали
 ExecStart=/bin/bash -lc './start_bot.sh'
 Restart=always

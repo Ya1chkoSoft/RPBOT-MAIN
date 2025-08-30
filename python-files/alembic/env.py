@@ -22,7 +22,7 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
-models_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Python files'))
+models_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'python-files'))
 if models_path not in sys.path:
     sys.path.insert(0, models_path)
 

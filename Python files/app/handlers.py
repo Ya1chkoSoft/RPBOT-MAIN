@@ -51,7 +51,7 @@ async def cmd_start(message: Message):
     )
     await message.answer(
         """<b>ПРИВЕТСТВУЮ В НАШЕМ РП БОТЕ</b>
-<i>версия бота 3.1</i>
+<i>версия бота 3.2</i>
 данный бот будет помогать вам в рп и тд:3
 ниже будет распологаться меню, желаем вам удачи""",
         parse_mode='HTML',
@@ -74,7 +74,7 @@ pattern = re.compile(
 
 
 #НАЗНАЧЕНИЕ АДМИНИСТРАЦИИ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-@router.message(F.text.startswith("рп назначить"))
+@router.message(F.text.lower().startswith("рп назначить"))
 async def handle_set_admin_level(message: Message):
     try:
         args = message.text.strip().split()
@@ -217,7 +217,7 @@ async def handle_set_admin_level(message: Message):
 
 
 
-@router.message(F.text.startswith("рп овнер назначить"))
+@router.message(F.text.lower().startswith("рп овнер назначить"))
 async def owner_assign_admin(message: Message):
     args = message.text.strip().split()
     if len(args) < 4:
@@ -274,7 +274,7 @@ async def owner_assign_admin(message: Message):
 
 
 #СНЯТИЕ АДМИНИСТРАЦИИ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-@router.message(F.text.startswith("рп снять"))
+@router.message(F.text.lower().startswith("рп снять"))
 async def handle_remove_admin(message: Message):
     args = message.text.strip().split(maxsplit=2)
 
@@ -337,7 +337,7 @@ async def handle_remove_admin(message: Message):
 
 
 #СПИСОК АДМИНИСТРАТОРОВ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-@router.message(F.text.startswith("рп админы"))
+@router.message(F.text.lower().startswith("рп админы"))
 async def list_admins(message: Message):
     async with async_session() as session:
         result = await session.execute(select(Admins))
@@ -359,7 +359,7 @@ async def list_admins(message: Message):
     await message.reply(admin_text)
 
 #НАЧИСЛЕНИЕ ОЧКОВ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-@router.message(F.text.startswith("рп начислить"))
+@router.message(F.text.lower().startswith("рп начислить"))
 async def handle_give_points_rp(message: Message):
     args = message.text.strip().split(maxsplit=3)
 
@@ -549,7 +549,8 @@ async def defrpcommandsbutton(callback: CallbackQuery):
 кубик - кидает кубик
 женщина,мужчина - угар комманды
 РП профиль - ваш профиль в меном мире:
-рп топ - то РП игроков''',
+рп топ - то РП игроков
+рп админы - список администраторов''',
         parse_mode='HTML',
         reply_markup=kb.main
     )
@@ -558,13 +559,13 @@ async def defrpcommandsbutton(callback: CallbackQuery):
 # Для каждого ключевого слова определяем список возможных ответов
 responses = {
     "женщина": [
-        'Я ЖЕНЩИНА',
+        'ыыыыыыыыы',
         'АААААА ЖЕНЩИНЫ БЛЯТЬ',
         'НЕЕЕЕЕЕТ УБЕРИ ЭТО',
         'ЭТО ПРОСТО НЕВОЗМОЖНО!!!',
         'СПАСАЙСЯ КТО МОЖЕТ',
         'Ох Ахъ женщины топчег  \n  *Застрелил черта*  туда егооооо',
-        'ЖЕНЩИНА В ЧАТЕ!!! \nСРОЧНО ТРАХАТЬ',
+        'ЖЕНЩИНА В ЧАТЕ!!! \nСРОЧНО СПАСАЙСЯ',
         'Ну бывает',
     ],
     "мужчина": [
@@ -577,6 +578,7 @@ responses = {
         'МУЖИК В ЧАТЕ!!! \nСРОЧНО ТРАХАТЬ И ПОШЛИ В ХОЙКУ',
         'Надо повысить',
         'БЫСТРО ЗОВИ ЕГО В ТЕРКУ!\n мы будем на пенсиле прыгать',
+        "ыыыыыыыыыы",
     ],
     # ... словарь для всех keywords
 }

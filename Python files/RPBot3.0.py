@@ -1,7 +1,7 @@
 import os
 import sys
 import logging
-import asyncio
+import tempfile
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher
@@ -9,24 +9,45 @@ from aiogram.client.default import DefaultBotProperties
 from app.handlers import router
 from app.database.models import async_main
 
-# 1) Загружаем .env (должен лежать в корне проекта рядом с папкой app)
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT')
 
-# 2) Включаем логирование
-logging.basicConfig(level=logging.INFO)
+log_handlers = [logging.StreamHandler(stream=sys.stdout)]
 
-# 3) Создаём объекты бота и диспетчера
-bot = Bot(token=BOT_TOKEN,default=DefaultBotProperties(parse_mode="HTML")
+# используем системный временный каталог
+tmp_dir = tempfile.gettempdir()
+log_file_path = os.path.join(tmp_dir, "bot_debug.log")
+
+try:
+    file_handler = logging.FileHandler(log_file_path, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    log_handlers.append(file_handler)
+except Exception as e:
+    # если что-то пойдет не так — оставляем только stdout и выводим warning
+    print("WARNING: cannot create file log handler:", e, file=sys.stderr)
+
+logging.basicConfig(
+    level=logging.DEBUG,  # DEBUG чтобы ловить logger.debug(...) из хендлеров
+    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
+    handlers=log_handlers
 )
+
+logging.getLogger('aiogram').setLevel(logging.INFO)
+logging.getLogger('app').setLevel(logging.DEBUG)
+
+# выводим путь к лог-файлу для удобства
+logging.info("Логи пишутся в: %s", log_file_path)
+# ----------------- /ЛОГИРОВАНИЕ -----------------
+
+# ВАЖНО: устанавливаем глобально parse_mode=None, чтобы Telegram не парсил HTML
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher()
 
-# 4) Обязательно подключаем роутер ДО старта polling
 dp.include_router(router)
 
 async def on_startup():
     logging.info("Инициализация базы...")
-    await async_main()  # создаёт все таблицы если их нет
+    await async_main()
     logging.info("База готова. Запускаем бота.")
 
 async def on_shutdown():
@@ -35,7 +56,6 @@ async def on_shutdown():
     logging.info("Бот остановлен.")
 
 if __name__ == "__main__":
-    # 5) Запускаем polling с колбеками
     try:
         dp.run_polling(
             bot,

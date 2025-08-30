@@ -40,7 +40,7 @@ class Admins(Base):
     adminlevel = Column(Integer, default=0, nullable=False)
 
     __table_args__ = (
-        CheckConstraint('adminlevel BETWEEN 0 AND 4', name='check_admin_level'),
+        CheckConstraint('adminlevel BETWEEN 0 AND 5', name='check_admin_level'),
     )
     user = relationship("User", back_populates="admin")
 

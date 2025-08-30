@@ -4,7 +4,11 @@ import pickle
 import re
 import sys
 import os
+import html
+import logging
+logger = logging.getLogger(__name__)
 
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
@@ -14,6 +18,7 @@ from aiogram.filters.state import State, StatesGroup
 # Импортируем только функции-обёртки для работы с БД
 from app.database.requests import get_or_create_user, get_balance, get_top, add_admin, get_user_by_username
 from sqlalchemy.future import select
+from sqlalchemy import func
 from app.database.models import User, Admins, History
 from app.database.session import async_session
 from datetime import datetime
@@ -23,6 +28,9 @@ import app.keyboard as kb
 
 from config import OWNER_ID
 
+load_dotenv()  # Загружаем переменные окружения из .env
+
+OWNER_ID = int(os.getenv("OWNER_ID"))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 class GivePointsStates(StatesGroup):
@@ -68,35 +76,173 @@ pattern = re.compile(
 #НАЗНАЧЕНИЕ АДМИНИСТРАЦИИ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 @router.message(F.text.startswith("рп назначить"))
 async def handle_set_admin_level(message: Message):
-    args = message.text.strip().split()  # убрал maxsplit, чтобы разделить все части
-    
+    try:
+        args = message.text.strip().split()
+        if len(args) < 4:
+            await message.reply("❗ Формат: рп назначить <user_id или @username> <уровень>")
+            return
+
+        target_str = args[2]
+        level_str = args[3]
+
+        if not level_str.isdigit():
+            await message.reply("❗ Уровень должен быть числом.")
+            return
+
+        new_level = int(level_str)
+        caller_id = message.from_user.id
+
+        async with async_session() as session:
+            # Получаем уровень вызывающего
+            if caller_id == OWNER_ID:
+                caller_adminlevel = 5  # OWNER может всё
+            else:
+                caller_result = await session.execute(select(Admins).where(Admins.user_id == caller_id))
+                caller = caller_result.scalar_one_or_none()
+                if not caller or caller.adminlevel < 5:
+                    await message.reply("🚫 У вас нет прав для назначения админов.")
+                    return
+                caller_adminlevel = caller.adminlevel
+
+            # Получаем целевого пользователя
+                target_user = None
+
+            if target_str.isdigit():
+                # Поиск по ID в базе
+                target_result = await session.execute(
+                    select(User).where(User.user_id == int(target_str))
+                )
+                target_user = target_result.scalar_one_or_none()
+            else:
+                # Сначала пробуем найти по username в базе (регистр игнорируем)
+                username = target_str.lstrip("@")
+                target_result = await session.execute(
+                    select(User).where(func.lower(User.username) == username.lower())
+                )
+                target_user = target_result.scalar_one_or_none()
+
+                # Если в базе нет — пробуем достать из Telegram по @username
+                if not target_user:
+                    try:
+                        tg_chat = await message.bot.get_chat(username)  # @username -> Chat/User
+                        # Проверяем, нет ли уже записи по user_id
+                        by_id_result = await session.execute(
+                            select(User).where(User.user_id == tg_chat.id)
+                        )
+                        target_user = by_id_result.scalar_one_or_none()
+
+                        if not target_user:
+                                # Создаём запись (сохранится при общем commit ниже)
+                            target_user = User(
+                                user_id=tg_chat.id,
+                                username=tg_chat.username,
+                                userfullname=tg_chat.full_name,
+                            )
+                            session.add(target_user)
+                            await session.flush()
+                        else:
+                            # Обновим ник/имя, если поменялись
+                            target_user.username = tg_chat.username
+                            target_user.userfullname = tg_chat.full_name
+                            session.add(target_user)
+                    except Exception:
+                        target_user = None
+            #проверка, что пользователь уже этого уровня
+            target_admin_result = await session.execute(select(Admins).where(Admins.user_id == target_user.user_id))
+            target_admin = target_admin_result.scalar_one_or_none()
+            if target_admin and target_admin.adminlevel == new_level:
+                await message.reply(f"❗ Пользователь уже имеет уровень {new_level}.")
+                return
+
+            if not target_user:
+                await message.reply("❌ Пользователь не найден.")
+                return
+
+            # Получаем текущий уровень админства целевого
+            target_admin_result = await session.execute(select(Admins).where(Admins.user_id == target_user.user_id))
+            target_admin = target_admin_result.scalar_one_or_none()
+            target_adminlevel = target_admin.adminlevel if target_admin else 0
+
+            # Проверка: нельзя назначить уровень выше своего (если не OWNER)
+            if new_level >= caller_adminlevel and caller_id != OWNER_ID:
+                await message.reply("Вы не можете назначить админа уровня равного или выше вашего.")
+                return
+
+            # Проверка: нельзя переназначать равного или вышестоящего (если не OWNER)
+            if target_admin and caller_adminlevel <= target_adminlevel and caller_id != OWNER_ID:
+                await message.reply("Вы не можете переназначить этого администратора. У него уровень выше или равный вашему.")
+                return
+
+            # Проверка: нельзя повысить выше максимального уровня
+            if new_level > 5:
+                await message.reply("Максимальный уровень администратора — 5.")
+                return
+
+            # Назначение уровня в базе
+            target_user.adminlevel = new_level
+            session.add(target_user)
+
+            if not target_admin:
+                session.add(Admins(user_id=target_user.user_id, adminlevel=new_level))
+            else:
+                target_admin.adminlevel = new_level
+                session.add(target_admin)
+
+            await session.commit()
+
+            # --- Собираем ответ телеграм ---
+            full_display = target_user.userfullname or f"@{(target_user.username or 'без_ника')}"
+            reply_text = (
+                f"✅ Пользователь {full_display} "
+                f"(ID: {target_user.user_id}) назначен админом уровня {new_level}."
+            )
+
+            # Отправляем в Telegram
+            await message.reply(reply_text)
+
+
+
+#            # --- ЛОГИ для отладки, если что-то пошло не так с кодировкой ---
+#            b = reply_text.encode('utf-8')
+#            logger.debug("OUTGOING_REPLY_REPR: %r", reply_text)         # Python repr (видно \n, \t и спецсимволы)
+#            logger.debug("OUTGOING_REPLY_HEX: %s", b.hex())             # чистые hex-байты
+#            logger.debug("OUTGOING_REPLY_UNICODE_POINTS: %s", [hex(ord(c)) for c in reply_text])
+
+    except ValueError as e:
+        await message.reply(f"❌ Произошла ошибка: {e}")
+    except TypeError as e:
+        await message.reply(f"❌ Произошла ошибка: {e}")
+    except Exception as e:
+        await message.reply(f"❌ Произошла ошибка: {e}")
+
+
+
+@router.message(F.text.startswith("рп овнер назначить"))
+async def owner_assign_admin(message: Message):
+    args = message.text.strip().split()
     if len(args) < 4:
-        await message.reply("❗ Формат: рп назначить <user_id или @username> <уровень>")
+        await message.reply("❗ Формат: рп овнер назначить <user_id или @username> <уровень>")
         return
 
-    target_str = args[2]  # третий элемент — пользователь или айди
-    level_str = args[3]   # четвертый — уровень
+    target_str = args[2]
+    level_str = args[3]
 
     if not level_str.isdigit():
         await message.reply("❗ Уровень должен быть числом.")
         return
 
     new_level = int(level_str)
+    if new_level < 0 or new_level > 5:
+        await message.reply("❗ Уровень должен быть от 0 до 5.")
+        return
+
     caller_id = message.from_user.id
+    if caller_id != OWNER_ID:
+        await message.reply("🚫 Только владелец может использовать эту команду.")
+        return
 
     async with async_session() as session:
-        # Определяем уровень вызывающего
-        if caller_id == OWNER_ID:
-            caller_adminlevel = 10  # максимально возможный уровень
-        else:
-            caller_result = await session.execute(select(Admins).where(Admins.user_id == caller_id))
-            caller = caller_result.scalar_one_or_none()
-            if not caller or caller.adminlevel < 5:
-                await message.reply("🚫 У вас нет прав для назначения админов.")
-                return
-            caller_adminlevel = caller.adminlevel
-
-        # Получаем целевого пользователя
+        # Получаем пользователя
         if target_str.isdigit():
             target_result = await session.execute(select(User).where(User.user_id == int(target_str)))
         else:
@@ -108,44 +254,23 @@ async def handle_set_admin_level(message: Message):
             await message.reply("❌ Пользователь не найден.")
             return
 
-        # Получаем текущий уровень админства целевого
-        target_admin_result = await session.execute(select(Admins).where(Admins.user_id == target_user.user_id))
-        target_admin = target_admin_result.scalar_one_or_none()
-
-        # 🔒 Проверка: нельзя переназначать равного или вышестоящего, если не OWNER
-        if target_admin and caller_adminlevel <= target_admin.adminlevel and caller_id != OWNER_ID:
-            await message.reply("🚫 Вы не можете переназначить этого администратора. У него уровень выше или равный вашему.")
-            return
-
-        # 🔒 Проверка: нельзя назначить уровень выше или равный себе (если не OWNER)
-        if new_level >= caller_adminlevel and caller_id != OWNER_ID:
-            await message.reply("🚫 Вы не можете назначить админа уровня равного или выше вашего.")
-            return
-
-        # ✅ Назначение уровня
+        # Назначаем уровень
         target_user.adminlevel = new_level
         session.add(target_user)
 
-        if not target_admin:
+        admin_result = await session.execute(select(Admins).where(Admins.user_id == target_user.user_id))
+        admin = admin_result.scalar_one_or_none()
+        if not admin:
             session.add(Admins(user_id=target_user.user_id, adminlevel=new_level))
         else:
-            target_admin.adminlevel = new_level
-            session.add(target_admin)
+            admin.adminlevel = new_level
+            session.add(admin)
 
         await session.commit()
-
         await message.reply(
             f"✅ Пользователь {target_user.userfullname or '@' + (target_user.username or 'без_ника')} "
             f"(ID: {target_user.user_id}) назначен админом уровня {new_level}."
         )
-        
-@router.message(F.text == "рп я овнер")
-async def make_myself_owner(message: Message):
-    caller_id = message.from_user.id
-    async with async_session() as session:
-        session.add(Admins(user_id=caller_id, adminlevel=4))
-        await session.commit()
-        await message.reply(f"✅ Вы добавлены как OWNER (уровень 4). ID: {caller_id}")
 
 
 #СНЯТИЕ АДМИНИСТРАЦИИ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -158,7 +283,7 @@ async def handle_remove_admin(message: Message):
         return
 
     target_str = args[2]
-    reason = args[3] if len(args) > 3 else "Без причины"
+    reason = (message.text.strip().replace("рп снять " + target_str, "").strip()) or "Без причины"
     remover_id = message.from_user.id
     OWNER_ID
 
@@ -209,6 +334,29 @@ async def handle_remove_admin(message: Message):
             f"Причина: {reason}"
         )
 
+
+
+#СПИСОК АДМИНИСТРАТОРОВ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+@router.message(F.text.startswith("рп админы"))
+async def list_admins(message: Message):
+    async with async_session() as session:
+        result = await session.execute(select(Admins))
+        admins = result.scalars().all()
+
+    if not admins:
+        await message.reply("Список администраторов пуст.")
+        return
+
+    admin_text = "Список администраторов:\n"
+    for admin in admins:
+        user_result = await session.execute(select(User).where(User.user_id == admin.user_id))
+        user = user_result.scalar_one_or_none()
+        if user:
+            admin_text += f"• {user.userfullname or '@' + (user.username or 'без_ника')} (ID: {user.user_id}) — уровень {admin.adminlevel}\n"
+        else:
+            admin_text += f"• ID: {admin.user_id} — уровень {admin.adminlevel} (пользователь не в базе)\n"
+
+    await message.reply(admin_text)
 
 #НАЧИСЛЕНИЕ ОЧКОВ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 @router.message(F.text.startswith("рп начислить"))

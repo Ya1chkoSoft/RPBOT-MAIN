@@ -563,9 +563,94 @@ async def handle_give_points_rp(message: Message):
             f"✅ Начислено {points} очков пользователю "
             f"{target_user.userfullname or '@' + (target_user.username or 'без_ника')} за: {reason}"
         )
+#передача очков  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+@router.message(F.text.lower().startswith("рп передать"))
+async def transfer_points(message: Message):
+    args = message.text.strip().split()
+    if len(args) < 3:
+        await message.reply("❗ Формат: рп передать <сумма> <@юзер или ID>")
+        return
+
+    amount_str = args[2]
+    if not amount_str.isdigit():
+        await message.reply("❗ Сумма должна быть числом.")
+        return
+
+    amount = int(amount_str)
+    if amount <= 0:
+        await message.reply("❗ Сумма должна быть больше нуля.")
+        return
+
+    sender_id = message.from_user.id
+    receiver_id = None
+
+    # Получатель из реплая
+    if message.reply_to_message:
+        receiver_id = message.reply_to_message.from_user.id
+    elif len(args) >= 4:
+        receiver_arg = args[3]
+
+        # Если @username
+        if receiver_arg.startswith("@"):
+            username = receiver_arg[1:]
+            async with async_session() as session:
+                user_result = await session.execute(
+                    select(User).where(User.username == username)
+                )
+                receiver = user_result.scalar_one_or_none()
+                if receiver:
+                    receiver_id = receiver.user_id
+        else:
+            # Пытаемся интерпретировать как ID
+            if receiver_arg.isdigit():
+                receiver_id = int(receiver_arg)
+
+    if not receiver_id:
+        await message.reply("❌ Укажите получателя (реплай или @username или ID).")
+        return
+
+    async with async_session() as session:
+        # ищем отправителя
+        sender_result = await session.execute(select(User).where(User.user_id == sender_id))
+        sender = sender_result.scalar_one_or_none()
+
+        if not sender:
+            await message.reply("❌ Вы не зарегистрированы.")
+            return
+
+        if sender.points < amount:
+            await message.reply("🚫 Недостаточно очков для перевода.")
+            return
+
+        # ищем получателя
+        receiver_result = await session.execute(select(User).where(User.user_id == receiver_id))
+        receiver = receiver_result.scalar_one_or_none()
+
+        if not receiver:
+            await message.reply("❌ Получатель не найден или не зарегистрирован.")
+            return
+
+        if receiver.user_id == sender.user_id:
+            await message.reply("❌ Нельзя переводить очки самому себе.")
+            return
+
+        # перевод
+        sender.points -= amount
+        receiver.points += amount
+
+        session.add_all([sender, receiver])
+        await session.commit()
+
+        await message.reply(
+            f"💸 {amount} очков успешно переведено!\n"
+            f"👤 Отправитель: {sender.username or sender.user_id}\n"
+            f"👤 Получатель: {receiver.username or receiver.user_id}\n"
+            f"💰 Ваш баланс: {sender.points}"
+        )
 
 #Казино на очках - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 SLOT_SYMBOLS = ["🍒", "🍋", "🦷", "⭐", "👼🏿"]  # можно расширить
+
 @router.message(F.text.lower().startswith("рп казино"))
 async def casino(message: Message):
     args = message.text.strip().split()
@@ -650,6 +735,144 @@ async def casino(message: Message):
             f"{result_text}\n\n💰 Ваш баланс: {user.points} очков.\n"
             f"Проверьте через 'рп профиль'."
         )
+#Функции слот машины - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+def generate_symbols(symbols, base_mult=2, mult_step=1, base_weight=30, weight_step=-5):
+    """
+    symbols: список символов (["🌚", "🍋", ...])
+    base_mult: множитель первого символа
+    mult_step: насколько растёт множитель к следующему символу
+    base_weight: вес (частота выпадения) первого символа
+    weight_step: насколько уменьшается вес к следующему символу
+    """
+    multipliers = {}
+    weights = []
+
+    for i, sym in enumerate(symbols):
+        # множитель растёт
+        multipliers[sym] = base_mult + mult_step * i
+        # вес уменьшается
+        weight = max(1, base_weight + weight_step * i)  # чтобы не уйти в 0 или минус
+        weights.append(weight)
+
+    return multipliers, weights
+
+
+#--------------- НАСТРОЙКА ----------------
+SLOT_SYMBOLS = ["🌚", "🍋", "⭐", "☢", "🎸", "👼🏿","🚺","🚹"]
+
+# генерим множители и веса автоматически
+SYMBOL_MULTIPLIERS, SYMBOL_WEIGHTS = generate_symbols(
+    SLOT_SYMBOLS,
+    base_mult=2,   # первый множитель
+    mult_step=1,   # шаг роста множителя
+    base_weight=30, # вес самого частого символа
+    weight_step=-5 # шаг уменьшения веса
+)
+def spin_slots():
+    return [[random.choice(SLOT_SYMBOLS) for _ in range(3)] for _ in range(3)]
+
+def format_slots(slots):
+    return "\n".join(" | ".join(row) for row in slots)
+
+def get_winning_lines(slots):
+    """Возвращает список всех выигрышных линий [(символ, описание, множитель)]."""
+    winning_lines = []
+    n = 3  # размер поля
+
+    # --- Горизонтали ---
+    for i in range(n):
+        if slots[i][0] == slots[i][1] == slots[i][2]:
+            winning_lines.append((slots[i][0], f"Горизонталь {i+1}", 1.0))
+
+    # --- Вертикали ---
+    for j in range(n):
+        if slots[0][j] == slots[1][j] == slots[2][j]:
+            winning_lines.append((slots[0][j], f"Вертикаль {j+1}", 1.0))
+
+    # --- Диагонали ---
+    if slots[0][0] == slots[1][1] == slots[2][2]:
+        winning_lines.append((slots[0][0], "Главная диагональ", 1.0))
+    if slots[0][2] == slots[1][1] == slots[2][0]:
+        winning_lines.append((slots[0][2], "Побочная диагональ", 1.0))
+
+    return winning_lines
+
+#СЛОТ МАШИНА 3 на 3  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+@router.message(F.text.lower().startswith("рп слот"))
+async def slot_machine(message: Message):
+    args = message.text.strip().split()
+    if len(args) < 3:
+        await message.reply("❗ Формат: рп казино <ставка>")
+        return
+
+    bet_str = args[2]
+    if not bet_str.isdigit():
+        await message.reply("❗ Ставка должна быть числом.")
+        return
+
+    bet = int(bet_str)
+    if bet <= 0:
+        await message.reply("❗ Ставка должна быть больше нуля.")
+        return
+
+    user_id = message.from_user.id
+    async with async_session() as session:
+        user_result = await session.execute(select(User).where(User.user_id == user_id))
+        user = user_result.scalar_one_or_none()
+
+        if not user:
+            await message.reply("❌ Вы не зарегистрированы, используйте /start.")
+            return
+        if user.points < bet:
+            await message.reply("🚫 Недостаточно очков, вы бедность❤")
+            return
+
+        # снимаем ставку
+        user.points -= bet
+
+        # создаем сообщение для анимации
+        msg = await message.reply("🎰 Запуск слотов...")
+
+        #--------------- АНИМАЦИЯ (1 вращение) ---------------
+        slots = None
+        for _ in range(2):  # было 5
+            slots = spin_slots()
+            field = format_slots(slots)
+            await msg.edit_text(f"🎰 Крутится...\n{field}")
+            await asyncio.sleep(0.8)  # было 0.4
+
+        # выбираем общий множитель
+        global_multiplier = round(random.uniform(0.5, 1.5), 1)
+
+        # ищем выигрышные линии
+        winning_lines = get_winning_lines(slots)
+        total_winnings = 0
+        lines_text = ""
+
+        if winning_lines:
+            for symbol, line, line_mult in winning_lines:
+                symbol_multiplier = SYMBOL_MULTIPLIERS.get(symbol, 1)
+
+                # обычные линии (горизонтали, вертикали, диагонали)
+                if line_mult == 1.0:
+                    line_winnings = int(bet * symbol_multiplier * global_multiplier)
+                    lines_text += f"{line}: {symbol} ×{symbol_multiplier} ×{global_multiplier} = {line_winnings}\n"
+
+                total_winnings += line_winnings  # суммируем
+
+            user.points += total_winnings  # добавляем выигрыш к балансу
+
+            result = f"🎉 Выигрышные линии:\n{lines_text}\n💵 Общий выигрыш: {total_winnings} очков!"
+        else:
+            result = f"❌ Увы, вы проиграли {bet} очков.\n💸 Всё ушло админу 😉"
+
+        session.add(user)
+        await session.commit()
+
+        await msg.edit_text(
+            f"🎰 Результат:\n{format_slots(slots)}\n\n{result}\n\n💰 Баланс: {user.points} очков."
+        )
+#Проверка что бот работает - - - - - - - - - - - - -
 @router.message(Command("ping"))
 async def test_ping(message: Message):
     await message.reply("pong")

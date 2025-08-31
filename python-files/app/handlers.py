@@ -6,6 +6,7 @@ import sys
 import os
 import html
 import logging
+import asyncio
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
@@ -71,7 +72,6 @@ pattern = re.compile(
     r"\b(" + "|".join(map(re.escape, keywords)) + r")\b",
     flags=re.IGNORECASE
 )
-
 
 #НАЗНАЧЕНИЕ АДМИНИСТРАЦИИ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 @router.message(F.text.lower().startswith("рп назначить"))
@@ -216,7 +216,7 @@ async def handle_set_admin_level(message: Message):
         await message.reply(f"❌ Произошла ошибка: {e}")
 
 
-
+# --- ОВНЕР НАЗНАЧИТЬ АДМИНА --- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 @router.message(F.text.lower().startswith("рп овнер назначить"))
 async def owner_assign_admin(message: Message):
     args = message.text.strip().split()
@@ -272,6 +272,127 @@ async def owner_assign_admin(message: Message):
             f"(ID: {target_user.user_id}) назначен админом уровня {new_level}."
         )
 
+# --- ОВНЕР НАЧИСЛИТЬ ОЧКИ --- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+@router.message(F.text.lower().startswith("рп овнер начислить"))
+async def owner_add_points(message: Message):
+    args = message.text.strip().split()
+
+    # Формат: рп овнер начислить @username <очки> <причина>
+    if len(args) < 5:
+        await message.reply("❗ Формат: рп овнер начислить @username <очки> <причина>")
+        return
+
+    caller_id = message.from_user.id
+    if caller_id != OWNER_ID:
+        await message.reply("🚫 Только владелец может использовать эту команду.")
+        return
+
+    username = args[3].replace("@", "")  # @username
+    points_str = args[4]
+
+
+    if not points_str.lstrip("-").isdigit():
+        await message.reply("❗ Количество очков должно быть целым числом.")
+        return
+
+    points = int(points_str)
+    if points == 0:
+        await message.reply("❗ Количество очков не может быть нулём.")
+        return
+
+    reason = " ".join(args[5:]) or "Без причины"
+
+    async with async_session() as session:
+        # ищем пользователя в базе
+        result = await session.execute(select(User).where(User.username == username))
+        user = result.scalar_one_or_none()
+
+        if not user:
+            await message.reply(f"🚫 Пользователь @{username} не найден в базе.")
+            return
+
+        # начисляем очки
+        user.points += points
+        session.add(user)
+
+        # сохраняем историю
+        history = History(
+            admin_id=caller_id,
+            target_id=user.user_id,
+            points=points,
+            reason=reason,
+            timestamp=datetime.now()
+        )
+        session.add(history)
+
+        await session.commit()
+
+    await message.reply(
+        f"✅ Пользователю @{username} начислено {points} очков.\n"
+        f"Причина: {reason}"
+    )
+
+
+# --- ОВНЕР ОТНЯТЬ ОЧКИ --- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+@router.message(F.text.lower().startswith("рп овнер отнять"))
+async def owner_remove_points(message: Message):
+    args = message.text.strip().split()
+
+    # Формат: рп овнер отнять @username <очки> <причина>
+    if len(args) < 5:
+        await message.reply("❗ Формат: рп овнер отнять @username <очки> <причина>")
+        return
+
+    caller_id = message.from_user.id
+    if caller_id != OWNER_ID:
+        await message.reply("🚫 Только владелец может использовать эту команду.")
+        return
+
+    username = args[3].replace("@", "")  # @username
+    points_str = args[4]
+
+    if not points_str.isdigit():
+        await message.reply("❗ Количество очков должно быть положительным целым числом.")
+        return
+
+    points = int(points_str)
+    if points <= 0:
+        await message.reply("❗ Количество очков должно быть больше нуля.")
+        return
+
+    reason = " ".join(args[5:]) or "Без причины"
+
+    async with async_session() as session:
+        # ищем пользователя в базе
+        result = await session.execute(select(User).where(User.username == username))
+        user = result.scalar_one_or_none()
+
+        if not user:
+            await message.reply(f"🚫 Пользователь @{username} не найден в базе.")
+            return
+
+        # вычитаем очки
+        user.points -= points
+        if user.points < 0:  # защита от отрицательного баланса
+            user.points = 0
+        session.add(user)
+
+        # сохраняем историю
+        history = History(
+            admin_id=caller_id,
+            target_id=user.user_id,
+            points=-points,  # минусовые очки
+            reason=reason,
+            timestamp=datetime.now()
+        )
+        session.add(history)
+
+        await session.commit()
+
+    await message.reply(
+        f"❌ У пользователя @{username} отнято {points} очков.\n"
+        f"Причина: {reason}"
+    )
 
 #СНЯТИЕ АДМИНИСТРАЦИИ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 @router.message(F.text.lower().startswith("рп снять"))
@@ -333,7 +454,6 @@ async def handle_remove_admin(message: Message):
             f"✅ {target_user.userfullname or '@' + (target_user.username or 'без_ника')} снят с админки.\n"
             f"Причина: {reason}"
         )
-
 
 
 #СПИСОК АДМИНИСТРАТОРОВ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -444,6 +564,92 @@ async def handle_give_points_rp(message: Message):
             f"{target_user.userfullname or '@' + (target_user.username or 'без_ника')} за: {reason}"
         )
 
+#Казино на очках - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+SLOT_SYMBOLS = ["🍒", "🍋", "🦷", "⭐", "👼🏿"]  # можно расширить
+@router.message(F.text.lower().startswith("рп казино"))
+async def casino(message: Message):
+    args = message.text.strip().split()
+    if len(args) < 3:
+        await message.reply("❗ Формат: рп казино <ставка>")
+        return
+
+    bet_str = args[2]
+    if not bet_str.isdigit():
+        await message.reply("❗ Ставка должна быть положительным числом.")
+        return
+
+    bet = int(bet_str)
+    if bet <= 0:
+        await message.reply("❗ Ставка должна быть больше нуля.")
+        return
+
+    user_id = message.from_user.id
+
+    async with async_session() as session:
+        user_result = await session.execute(select(User).where(User.user_id == user_id))
+        user = user_result.scalar_one_or_none()
+
+        if not user:
+            await message.reply("❌ Вы не зарегистрированы в системе. Используйте /start.")
+            return
+
+        if user.points < bet:
+            await message.reply("🚫 У вас недостаточно очков для этой ставки.")
+            return
+
+        # снимаем ставку
+        user.points -= bet
+
+        # крутим слоты
+        slot1 = random.choice(SLOT_SYMBOLS)
+        slot2 = random.choice(SLOT_SYMBOLS)
+        slot3 = random.choice(SLOT_SYMBOLS)
+
+        # анимация "вращения"
+        msg = await message.reply("🎰 Крутим барабаны...")
+        await asyncio.sleep(1)
+        await msg.edit_text(f"🎰 | {slot1} | ❓ | ❓ |")
+        await asyncio.sleep(1)
+        await msg.edit_text(f"🎰 | {slot1} | {slot2} | ❓ |")
+        await asyncio.sleep(1)
+        await msg.edit_text(f"🎰 | {slot1} | {slot2} | {slot3} |")
+
+        # случайный множитель (показываем даже при проигрыше)
+        multiplier = round(random.uniform(2.0, 5.3), 2)
+
+        # проверка совпадений
+        if slot1 == slot2 == slot3:
+            # джекпот
+            winnings = int(bet * multiplier)
+            user.points += winnings
+            result_text = (
+                f"✨ Джекпот! Три одинаковых символа!\n"
+                f"💎 Множитель: {multiplier}x\n"
+                f"🏆 Вы выиграли {winnings} очков!"
+            )
+        # две пары
+        elif slot1 == slot2 or slot2 == slot3 or slot1 == slot3:
+            winnings = int(bet * (multiplier / 2.5))
+            user.points += winnings
+            result_text = (
+                f"🎉 Поздравляем! Два одинаковых символа!\n"
+                f"💎 Множитель: {multiplier/2}x\n"
+                f"🏆 Вы выиграли {winnings} очков!"
+            )
+        else:
+            result_text = (
+                f"❌ Увы, вы проиграли.\n"
+                f"💰 Ваша ставка: {bet} очков\n"
+                f"🔢 Множитель на этот раунд: {multiplier}x"
+            )
+
+        session.add(user)
+        await session.commit()
+
+        await message.reply(
+            f"{result_text}\n\n💰 Ваш баланс: {user.points} очков.\n"
+            f"Проверьте через 'рп профиль'."
+        )
 @router.message(Command("ping"))
 async def test_ping(message: Message):
     await message.reply("pong")

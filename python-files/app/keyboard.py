@@ -28,4 +28,6 @@ async def inmenu():
     for buttons in menu:
         keyboard.add(InlineKeyboardButton(text=buttons,callback_data='menu'))
     return keyboard.adjust(1).as_markup()
-    
+
+
+# Команда для начала создания мемной страны

@@ -1,67 +1,98 @@
+import logging
 import os
 import sys
-import logging
-import tempfile
+import asyncio
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+
 from app.handlers import router
 from app.database.models import async_main
+from app.database.session import engine
+from app.countrycreate import country_create_router
+from app.database.session import async_session as DB_POOL
+from app.admin_router import admin_router
 
-load_dotenv()
-BOT_TOKEN = os.getenv('BOT')
+# --- МИДЛВАРЕ ---
+from app.database.middleware import SessionMiddleware 
+from app.database.user_middleware import UserMiddleware
+# ----------------------------------------
+DATABASE_URL = f"postgresql+asyncpg://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@localhost:5432/{os.getenv('POSTGRES_DB')}"
+logger = logging.getLogger(__name__)
 
-log_handlers = [logging.StreamHandler(stream=sys.stdout)]
+async def main() -> None:
+    load_dotenv()
+    BOT_TOKEN = os.getenv('BOT')
 
-# используем системный временный каталог
-tmp_dir = tempfile.gettempdir()
-log_file_path = os.path.join(tmp_dir, "bot_debug.log")
+    if not BOT_TOKEN:
+        logger.error("Error: BOT_TOKEN is not set in the environment.")
+        sys.exit(1)
 
-try:
-    file_handler = logging.FileHandler(log_file_path, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    log_handlers.append(file_handler)
-except Exception as e:
-    # если что-то пойдет не так — оставляем только stdout и выводим warning
-    print("WARNING: cannot create file log handler:", e, file=sys.stderr)
+    # === Ожидание готовности PostgreSQL ===
+    max_attempts = 30  # Максимум 30 попыток (2.5 минуты)
+    attempt = 0
 
-logging.basicConfig(
-    level=logging.DEBUG,  # DEBUG чтобы ловить logger.debug(...) из хендлеров
-    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
-    handlers=log_handlers
-)
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            async with engine.connect() as conn:
+                pass
+            logger.info("✅ Подключение к PostgreSQL успешно.")
+            break
 
-logging.getLogger('aiogram').setLevel(logging.INFO)
-logging.getLogger('app').setLevel(logging.DEBUG)
+        except Exception as e:
+            logger.warning(f"⚠️ PostgreSQL не готов (попытка {attempt}/{max_attempts}). Ожидание 5 секунд...")
+            logger.debug(f"Подробная ошибка подключения: {e}")  # Детали в debug (если включишь уровень DEBUG)
+            await asyncio.sleep(5)
+    else:
+        logger.error("❌ Не удалось подключиться к PostgreSQL после %s попыток. Завершаю работу.", max_attempts)
+        sys.exit(1)
 
-# выводим путь к лог-файлу для удобства
-logging.info("Логи пишутся в: %s", log_file_path)
-# ----------------- /ЛОГИРОВАНИЕ -----------------
 
-# ВАЖНО: устанавливаем глобально parse_mode=None, чтобы Telegram не парсил HTML
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
-dp = Dispatcher()
+    bot = Bot(
+        token=BOT_TOKEN, 
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    ) 
+    dp = Dispatcher()
 
-dp.include_router(router)
+    # ============================================================
+    #MIDDLEWARE (ПОРЯДОК ВАЖЕН)
+    # ============================================================
+    # 1. Сначала SessionMiddleware.
+    dp.update.outer_middleware(SessionMiddleware()) 
+    # 2. Затем UserMiddleware.
+    # Он работает внутри сессии. Регистрируем на message и callback_query.
+    user_middleware = UserMiddleware()
+    dp.message.middleware(user_middleware)
+    dp.callback_query.middleware(user_middleware)
 
-async def on_startup():
-    logging.info("Инициализация базы...")
-    await async_main()
-    logging.info("База готова. Запускаем бота.")
+    # ============================================================
+    dp.include_router(admin_router)
+    dp.include_router(country_create_router)
+    dp.include_router(router)
 
-async def on_shutdown():
-    logging.info("Останавливаем бота...")
-    await bot.session.close()
-    logging.info("Бот остановлен.")
+    async def on_startup() -> None:
+        await async_main()
+        logger.info("✅ Database initialized and ready.")
+    
+    dp.startup.register(on_startup)
+
+    logger.info("Starting bot polling...")
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error("An error occurred during polling: %s", e)
+    finally:
+        logger.info("Bot shutting down.")
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
     try:
-        dp.run_polling(
-            bot,
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            skip_updates=True
-        )
+        asyncio.run(main()) 
     except KeyboardInterrupt:
-        logging.info("Бот завершён вручную.")
+        logger.info("Bot stopped by user.")

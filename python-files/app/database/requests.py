@@ -1,91 +1,508 @@
-from sqlalchemy.future import select
-from sqlalchemy.orm import Session
-from .session import async_session
-from .models import User, History, Admins
+import logging
+import html
+from html import escape as escape_html
 from datetime import datetime
+from sqlalchemy import select, update, desc, func, and_, delete # + and_, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload, selectinload # + selectinload
+from sqlalchemy.future import select
+from datetime import datetime, timedelta # + timedelta
+from typing import Optional
+# Импортируем модели из твоего файла models.py
+from .models import User, History, Admins, MemeCountry, CountryReview # + CountryReview
 
-# 1) get_or_create_user: возвращает объект User, создавая нового, если не найден
-async def get_or_create_user(user_id: int, username: str, userfullname:str) -> User:
-    async with async_session() as session:
-        async with session.begin():
-            result = await session.execute(
-                select(User).where(User.user_id == user_id)
-            )
-            user = result.scalars().first()
-            if user:
-                # если есть, обновляем username
-                user.username = username
-            else:
-                # если нет, создаём нового
-                user = User(user_id=user_id, username=username,userfullname=userfullname)
-                session.add(user)
-        # при выходе из session.begin() происходит commit
+# Импортируем модели из твоего файла models.py
+# (Убедись, что путь импорта верный, например from .models import ...)
+from .models import User, History, Admins, MemeCountry
+
+#Импортируем FuzzyWuzzy для нечеткого поиска
+from thefuzz import fuzz
+
+#ИМПОРТ КОНСТАНТЫ
+from config import (
+    FUZZY_MATCH_THRESHOLD, 
+    RP_TO_INFLUENCE_RATIO
+)
+
+
+
+
+# ==========================================
+# 1. ПОЛЬЗОВАТЕЛИ (USER MANAGEMENT)
+# ==========================================
+# Предполагается, что User импортирован из models.py
+
+async def get_or_create_user(
+    session: AsyncSession, 
+    user_id: int, 
+    username: str = "", 
+    userfullname: str = ""
+) -> User:
+    """
+    Получает пользователя. Если нет — создает.
+    """
+    stmt = select(User).where(User.user_id == user_id)
+    result = await session.execute(stmt)
+    user = result.scalar_one_or_none()
+
+    if user:
+        # Обновление данных
+        if user.username != username:
+            user.username = username
+        if user.userfullname != userfullname:
+            user.userfullname = userfullname
+        # flush происходит автоматически при commit, но можно и явно
+    else:
+        # Создание нового
+        user = User(
+            user_id=user_id, 
+            username=username, 
+            userfullname=userfullname,
+            position="Путешественник", # Явно задаем должность
+            points=0,
+            adminlevel=0
+        )
+        session.add(user)
+        # await session.flush() # Не обязательно, commit сделает это
+    
     return user
 
-# 2) get_balance: возвращает points или 0, если нет записи
-async def get_balance(user_id: int) -> int:
-    async with async_session() as session:
-        result = await session.execute(
-            select(User.points).where(User.user_id == user_id)
-        )
-        points = result.scalar_one_or_none()
-    return points or 0
-
-async def add_admin(user_id: int, username: str | None = None, userfullname: str | None = None, adminlevel: int = 1) -> Admins:
-    async with async_session() as session:
-        async with session.begin():
-            result = await session.execute(select(Admins).where(Admins.user_id == user_id))
-            admin = result.scalars().first()
-
-            if admin:
-                updated = False
-                if username and admin.username != username:
-                    admin.username = username
-                    updated = True
-                if userfullname and admin.userfullname != userfullname:
-                    admin.userfullname = userfullname
-                    updated = True
-                if admin.adminlevel != adminlevel:
-                    admin.adminlevel = adminlevel
-                    updated = True
-                return admin
-
-            new_admin = Admins(
+async def db_ensure_full_user_profile(
+    session: AsyncSession, 
+    user_id: int, 
+    username: str, 
+    userfullname: str
+) -> tuple[Optional[User], bool]:
+    """
+    Гарантированно возвращает профиль пользователя.
+    Если юзера нет -> создает, коммитит, сбрасывает кэш и возвращает профиль.
+    """
+    
+    # 1. Сначала пробуем получить (может вернуть None)
+    profile = await get_full_user_profile(session, user_id)
+    was_created = False
+    
+    if profile is None:
+        try:
+            # 2. Создаем (или обновляем базовую запись)
+            await get_or_create_user(
+                session=session,
                 user_id=user_id,
                 username=username,
-                userfullname=userfullname,
-                adminlevel=adminlevel
+                userfullname=userfullname
             )
-            session.add(new_admin)
-            return new_admin
-        
-async def get_user_by_username(username: str):
-    async with async_session() as session:
-        result = await session.execute(
-            select(User).where(User.username == username)
+            
+            # 3. ФИКСИРУЕМ создание
+            await session.commit() 
+            
+            # 4. ВАЖНО: Сбрасываем кэш сессии, чтобы следующий SELECT увидел изменения
+            session.expire_all() 
+            
+            # 5. Загружаем полный профиль заново (теперь он точно есть)
+            profile = await get_full_user_profile(session, user_id)
+            
+            if profile:
+                was_created = True
+            else:
+                logging.error(f"FATAL: User {user_id} created but not found by select!")
+            
+        except Exception as e:
+            await session.rollback()
+            logging.error("Критическая ошибка при регистрации пользователя %s: %s", user_id, e)
+            return None, False
+
+    return profile, was_created
+
+async def get_full_user_profile(session: AsyncSession, user_id: int) -> User | None:
+    """
+    Получает профиль пользователя с предзагруженными отношениями.
+    - ruled_country_list: чтобы проверка на правителя не вызывала lazy load ошибку.
+    - country и admin: как было раньше (joinedload ок для single, но можно на selectinload).
+    """
+    stmt = (
+        select(User)
+        .where(User.user_id == user_id)
+        .options(
+            selectinload(User.ruled_country_list),
+            joinedload(User.country),               #(страна гражданина)
+            joinedload(User.admin)                  # Если есть админка
         )
-        return result.scalars().first()
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+async def get_user_by_username(session: AsyncSession, username: str) -> User | None:
+    """
+    Находит пользователя по его уникальному username (никнейму) в Telegram.
+    """
+    # Сначала удаляем символ '@', если он присутствует
+    clean_username = username.lstrip('@') 
     
-# 4) add_points: меняет баллы пользователя и пишет запись в историю
-def give_points(session: Session, admin_id: int, target_id: int, points: int, reason: str) -> str:
-    # 1. Получаем админа
-    admin = session.query(Admins).filter_by(user_id=admin_id).first()
-    if not admin:
-        return "Ошибка: Вы не админ."
+    stmt = (
+        select(User)
+        .where(User.username == clean_username)
+    )
+    result = await session.execute(stmt)
+    # Возвращаем найденный объект User или None, если он не найден
+    return result.scalar_one_or_none()
 
-    # 2. Получаем целевого пользователя
-    target_user = session.query(User).filter_by(user_id=target_id).first()
+# ==========================================
+# 2. МЕМНЫЕ СТРАНЫ (MEME COUNTRIES)
+# ==========================================
+
+from typing import Optional # Добавьте импорт, если его нет
+from .models import MemeCountry, User # Убедитесь, что User импортирован
+
+async def create_meme_country(
+    session: AsyncSession, 
+    ruler_id: int,                      # ID создателя (будущего правителя)
+    chat_id: int,                       # ID чата, в котором была создана
+    name: str, 
+    ideology: str,                      # Теперь обязательное поле
+    description: str = "Описание не предоставлено.", 
+    avatar_url: Optional[str] = None,   # File ID флага/аватара
+    map_url: Optional[str] = None,       # Ссылка на карту
+    memename: str = "Мем не задан"    # Мем страны
+) -> MemeCountry:
+    """Создает новую страну с основными параметрами."""
+    new_country = MemeCountry(
+        ruler_id=ruler_id,
+        chat_id=chat_id,
+        name=name, 
+        ideology=ideology,
+        description=description,
+        avatar_url=avatar_url,
+        map_url=map_url,
+        memename=memename
+        
+        # Остальные поля (influence_points, avg_rating) должны иметь значения по умолчанию в модели
+    )
+    
+    session.add(new_country)
+    return new_country
+
+
+async def assign_ruler(session: AsyncSession, user_id: int, country_id: int) -> tuple[bool, str]:
+    """
+    Коронация: Делает юзера правителем страны и обновляет его статус.
+    """
+    # 1. Получаем страну и юзера
+    # 💡 Используем get() для чистой загрузки
+    country = await session.get(MemeCountry, country_id)
+    user = await session.get(User, user_id)
+
+    if not country or not user:
+        return False, "Страна или Пользователь не найдены."
+
+    # 2. Логика смены власти
+    if country.ruler:
+        # Снимаем полномочия с предыдущего правителя (если есть)
+        if hasattr(country.ruler, 'is_ruler'):
+            country.ruler.is_ruler = False
+        country.ruler.position = "Бывший правитель"
+    user.country_id = country_id    # ✅ Используем ID, а не объектную связь user.country = country
+    
+    if hasattr(user, 'is_ruler'):
+        user.is_ruler = True
+        
+    user.position = "Правитель"       # Должность в стране
+    user.points += 10  # Бонусные очки за коронацию
+    # 4. Установка кулдауна
+    # Это было пропущено в вашей функции, но должно быть сделано здесь.
+    user.last_country_creation = datetime.now() 
+
+    # session.commit() должен вызываться в тележке вызова, а не здесь.
+    return True, f"Да здравствует новый правитель {country.name} — {user.userfullname}!"
+async def get_country_by_name(session: AsyncSession, name: str) -> MemeCountry | None:
+    """
+    Находит страну по ее названию, не учитывая регистр.
+    """
+    # Используем func.lower() для поиска без учета регистра
+    stmt = select(MemeCountry).where(
+        func.lower(MemeCountry.name) == func.lower(name)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_my_country_stats(session: AsyncSession, user_id: int) -> dict | None:
+    """
+    Возвращает полную статистику страны, в которой состоит пользователь.
+    Включает: объект страны, имя правителя, кол-во граждан, сумму очков граждан.
+    """
+    # 1. Получаем пользователя, чтобы узнать ID страны
+    user = await session.get(User, user_id)
+    
+    if not user or not user.country_id:
+        return None
+
+    country_id = user.country_id
+
+    # 2. Получаем объект страны с подгрузкой Правителя
+    stmt_country = (
+        select(MemeCountry)
+        .options(selectinload(MemeCountry.ruler))
+        .where(MemeCountry.country_id == country_id)
+    )
+    result_country = await session.execute(stmt_country)
+    country = result_country.scalar_one_or_none()
+
+    if not country:
+        return None
+
+    # 3. Считаем статистику по гражданам (Количество и Сумма очков)
+    stmt_stats = (
+        select(
+            func.count(User.user_id),      # Количество граждан
+            func.sum(User.points)          # Сумма их очков
+        )
+        .where(User.country_id == country_id)
+    )
+    result_stats = await session.execute(stmt_stats)
+    count, total_points = result_stats.one()
+
+    # Если очков нет (None), ставим 0
+    total_points = total_points if total_points else 0
+
+    return {
+        "country": country,
+        "citizens_count": count,
+        "citizens_total_points": total_points
+    }
+
+
+async def find_country_by_fuzzy_name(session: AsyncSession, query: str) -> Optional[MemeCountry]:
+    """Находит страну по названию или мем-имени. 75 — идеальный порог для 50–70 стран."""
+    query = query.strip().lower()
+    if len(query) < 2:
+        return None
+
+    # Берём только нужные поля — быстро и без тормозов
+    result = await session.execute(
+        select(MemeCountry.country_id, MemeCountry.name, MemeCountry.memename)
+    )
+    countries = result.all()
+
+    if not countries:
+        return None
+
+    best_match = None
+    best_score = FUZZY_MATCH_THRESHOLD  # у тебя 75 в конфиге — идеально!
+
+    for country_id, name, memename in countries:
+        # Ищем по названию И по мем-имени
+        score1 = fuzz.token_sort_ratio(query, name.lower())
+        score2 = fuzz.token_sort_ratio(query, (memename or "").lower())
+        score = max(score1, score2)
+
+        if score > best_score:
+            best_score = score
+            best_match = await session.get(MemeCountry, country_id)
+
+    return best_match
+
+# ==========================================
+# 2.1 ВСТУПЛЕНИЕ В СТРАНУ (JOIN COUNTRY)
+# ==========================================
+async def join_country(
+    session: AsyncSession,
+    user_id: int,
+    search_method: str,
+    search_value: str
+) -> tuple[bool, str]:
+    """
+    Полная логика вступления в страну.
+    Авторегистрация новичков, защита от правителей, рофлы и история.
+    """
+    # 1. Гарантированно получаем профиль (создаёт, если нет)
+    profile, was_created = await db_ensure_full_user_profile(
+        session=session,
+        user_id=user_id,
+        username="",  # Можно передать из message, если хочешь точные данные
+        userfullname=""
+    )
+
+    if profile is None:
+        return False, "❌ Внутренняя ошибка при загрузке профиля. Попробуйте позже."
+
+    user = profile  # Теперь user — полностью загруженный объект
+
+    # Приветствие новичку
+    extra_msg = ""
+    if was_created:
+        extra_msg = "👋 Вы автоматически зарегистрированы в системе!\nДобро пожаловать в мир мемных стран 🎉\n\n"
+
+    # 2. Блокировка для правителей
+    # ruled_country_list уже загружен через joinedload в get_full_user_profile
+    if user.ruled_country_list:
+        return False, (
+            "🚫 Вы — правитель одной или нескольких стран.\n"
+            "Пока у вас есть власть, вступить в другую страну нельзя.\n"
+            "Удалите или передайте свою страну сначала."
+        )
+
+    # 3. Поиск страны
+    target_country = None
+    if search_method == "id":
+        try:
+            target_id = int(search_value)
+            target_country = await session.get(MemeCountry, target_id)
+        except ValueError:
+            return False, "🚫 ID страны должен быть числом."
+
+    elif search_method == "name":
+        target_country = await find_country_by_fuzzy_name(session, search_value)
+    else:
+        return False, "🚫 Неизвестный метод. Используйте <code>id</code> или <code>name</code>."
+
+    if not target_country:
+        return False, f"❌ Страна не найдена по запросу: <b>{search_value}</b>"
+
+    # 4. Уже в этой стране?
+    if user.country_id == target_country.country_id:
+        return False, f"ℹ️ Вы уже гражданин <b>{hbold(target_country.name)}</b>."
+
+    # 5. Определяем тип события и текст
+    old_country_name = None
+    if user.country_id:
+        old_country = await session.get(MemeCountry, user.country_id)
+        if old_country:
+            old_country_name = old_country.name
+
+    if old_country_name:
+        event_type = "CHANGE_COUNTRY"
+        reason = f"Смена страны: {old_country_name} → {target_country.name}"
+        welcome_text = (
+            f"✅ Вы сменили гражданство!\n"
+            f"Теперь вы гражданин <b>{target_country.name}</b>.\n"
+            f"Предательство? Или поиск лучшей жизни? 🤔"
+        )
+    else:
+        event_type = "JOIN_COUNTRY"
+        reason = f"Вступление в страну: {target_country.name}"
+        welcome_text = (
+            f"✅ Добро пожаловать в <b>{target_country.name}</b>!\n"
+            f"Теперь вы официальный гражданин 🎉"
+        )
+
+    # 6. Обновляем пользователя
+    user.country_id = target_country.country_id
+    user.position = "Гражданин"
+
+    # 7. Записываем в историю
+    session.add(History(
+        admin_id=None,
+        target_id=user_id,
+        event_type=event_type,
+        points=0,
+        reason=reason
+    ))
+
+    await session.flush()
+
+    # 8. Финальный текст с приветствием новичку
+    final_text = extra_msg + welcome_text
+    return True, final_text
+# ==========================================
+# 2.2 ВЫХОД ИЗ СТРАНЫ (LEAVE COUNTRY / LEAVE)
+# ==========================================
+async def leave_country(session: AsyncSession, user_id: int) -> tuple[bool, str, str | None]:
+    """
+    Удаляет пользователя из страны, обнуляя country_id.
+    """
+    from sqlalchemy.orm import selectinload # Импорт необходим для корректной подгрузки страны
+    
+    # Получаем пользователя СРАЗУ с его текущей страной
+    stmt = select(User).options(
+        selectinload(User.country)
+    ).where(User.user_id == user_id)
+    
+    result = await session.execute(stmt)
+    user = result.scalar_one_or_none()
+    
+    # Эта проверка должна выполняться, потому что мы не используем get_or_create_user здесь
+    if not user:
+         return False, "Пользователь не найден в базе.", None
+
+    if user.country_id is None:
+        return False, "Вы ни в какой стране не состоите.", None
+    
+    # Правитель не может просто "выйти", он должен отречься через /transferpower
+    if user.is_ruler:
+        return False, "Вы правитель! Используйте команду передачи власти.", None
+
+
+    country_name = user.country.name if user.country else "Неизвестная страна"
+
+    # Обнуление полей
+    user.country_id = None
+    user.position = "Путешественник"
+
+    await session.flush()
+    
+    return True, "Успешно", country_name
+
+
+# ==========================================
+# 3. АДМИНИСТРАТОРЫ И БАЛЛЫ (ADMINS & POINTS)
+# ==========================================
+
+async def add_admin(
+    session: AsyncSession, 
+    user_id: int, 
+    username: str = None, 
+    userfullname: str = None, 
+    adminlevel: int = 1
+) -> Admins:
+    """Добавляет или обновляет админа."""
+    stmt = select(Admins).where(Admins.user_id == user_id)
+    result = await session.execute(stmt)
+    admin = result.scalar_one_or_none()
+
+    if admin:
+        if username: admin.username = username
+        if userfullname: admin.userfullname = userfullname
+        admin.adminlevel = adminlevel
+    else:
+        admin = Admins(
+            user_id=user_id,
+            username=username,
+            userfullname=userfullname,
+            adminlevel=adminlevel
+        )
+        session.add(admin)
+    
+    return admin
+
+
+async def give_points(
+    session: AsyncSession, 
+    admin_id: int, 
+    target_id: int, 
+    points: int, 
+    reason: str
+) -> str:
+    """
+    АСИНХРОННАЯ выдача баллов.
+    Проверяет права админа -> начисляет -> пишет в историю.
+    """
+    # 1. Проверяем админа
+    stmt_admin = select(Admins).where(Admins.user_id == admin_id)
+    res_admin = await session.execute(stmt_admin)
+    admin_obj = res_admin.scalar_one_or_none()
+
+    if not admin_obj or admin_obj.adminlevel <= 0:
+        return "⛔ Ошибка: У вас нет прав начислять очки."
+
+    # 2. Получаем цель
+    target_user = await session.get(User, target_id)
     if not target_user:
-        return "Ошибка: Пользователь не найден."
+        return "⛔ Ошибка: Пользователь не найден."
 
-    # 3. Проверка прав админа (может добавить свои условия, например, >= target.level и т.д.)
-    if admin.adminlevel == 0:
-        return "Ошибка: У вас нет прав начислять очки."
-
-    # 4. Начисляем очки
+    # 3. Начисляем
     target_user.points += points
 
-    # 5. Сохраняем историю
+    # 4. Пишем историю
     history = History(
         admin_id=admin_id,
         target_id=target_id,
@@ -94,28 +511,125 @@ def give_points(session: Session, admin_id: int, target_id: int, points: int, re
         timestamp=datetime.now()
     )
     session.add(history)
+    
+    # Коммит делает вызывающая сторона (хендлер), но если логика простая,
+    # можно сделать flush здесь, чтобы убедиться в отсутствии ошибок.
+    return f"✅ {points} очков начислено пользователю {target_user.userfullname} за: {reason}"
 
-    # 6. Подтверждаем изменения
-    session.commit()
-    return f"✅ {points} очков начислено пользователю {target_user.userfullname or target_user.username} за: {reason}"
 
-# 5) get_top: возвращает топ-N пользователей по убыванию points
-async def get_top(limit: int = 10) -> list[User]:
-    async with async_session() as session:
-        result = await session.execute(
-            select(User).order_by(User.points.desc()).limit(limit)
+# ==========================================
+# 4. СТАТИСТИКА (STATS)
+# ==========================================
+
+async def get_top_users(session: AsyncSession, limit: int = 10) -> list[User]:
+    """
+    Топ пользователей + название их страны (за 1 запрос).
+    """
+    stmt = (
+        select(User)
+        .order_by(desc(User.points))
+        .limit(limit)
+        .options(joinedload(User.country)) # Важно для отображения в топе
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_history(session: AsyncSession, target_id: int, limit: int = 20) -> list[History]:
+    """История наказаний/поощрений."""
+    stmt = (
+        select(History)
+        .where(History.target_id == target_id)
+        .order_by(desc(History.timestamp))
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+# ==========================================
+# 5. ОТЗЫВЫ (REVIEWS)
+# ==========================================
+# Настройки КД
+REVIEW_COOLDOWN_DAYS = 7 # Раз в неделю можно менять оценку
+
+# --- ЛОГИКА ОТЗЫВОВ ---
+
+async def check_review_cooldown(session: AsyncSession, user_id: int, country_id: int) -> tuple[bool, str]:
+    """
+    Проверяет, прошел ли КД. Возвращает (True, "") если можно голосовать,
+    или (False, "время") если рано.
+    """
+    stmt = select(CountryReview.created_at).where(
+        and_(
+            CountryReview.user_id == user_id,
+            CountryReview.country_id == country_id
         )
-        top_users = result.scalars().all()
-    return top_users
+    )
+    last_review_date = await session.scalar(stmt)
+    
+    if last_review_date:
+        # Считаем, сколько прошло
+        time_passed = datetime.now() - last_review_date
+        cooldown = timedelta(days=REVIEW_COOLDOWN_DAYS)
+        
+        if time_passed < cooldown:
+            remaining = cooldown - time_passed
+            # Форматируем время (дни, часы)
+            rem_str = str(remaining).split('.')[0] 
+            return False, rem_str
+            
+    return True, ""
 
-# 6) get_history: возвращает последние записи из history для данного user
-async def get_history(target_id: int, limit: int = 20) -> list[History]:
-    async with async_session() as session:
-        result = await session.execute(
-            select(History)
-            .where(History.target_id == target_id)
-            .order_by(History.timestamp.desc())
-            .limit(limit)
+async def save_review(session: AsyncSession, user_id: int, country_id: int, rating: int):
+    """Сохраняет отзыв (удаляя старый) и обновляет рейтинг страны."""
+    
+    # 1. Удаляем старый (если был) - благодаря UniqueConstraint это безопасно
+    # Но для чистоты created_at лучше сделать upsert или delete+insert
+    await session.execute(
+        delete(CountryReview).where(
+            and_(CountryReview.user_id == user_id, CountryReview.country_id == country_id)
         )
-        entries = result.scalars().all()
-    return entries
+    )
+    
+    # 2. Вставляем новый
+    session.add(CountryReview(user_id=user_id, country_id=country_id, rating=rating))
+    await session.flush()
+    
+    # 3. Пересчитываем среднее для страны
+    stats = await session.execute(
+        select(func.avg(CountryReview.rating), func.count(CountryReview.review_id))
+        .where(CountryReview.country_id == country_id)
+    )
+    avg, count = stats.one()
+    
+    # 4. Обновляем страну
+    await session.execute(
+        update(MemeCountry)
+        .where(MemeCountry.country_id == country_id)
+        .values(avg_rating=avg if avg else 0, total_reviews=count)
+    )
+
+# --- ЛОГИКА СПИСКА И ВСТУПЛЕНИЯ ---
+
+async def get_countries_for_list(session: AsyncSession, page: int, limit: int = 5):
+    """
+    Возвращает список стран с пагинацией.
+    Сортирует: 1. По очкам влияния (убывание). 2. По названию (возрастание).
+    """
+    offset = (page - 1) * limit
+    
+    stmt = (
+        select(MemeCountry)
+        .order_by(
+            desc(MemeCountry.influence_points), # Сначала по Влиянию (от большего к меньшему)
+            MemeCountry.name                    # Затем по Названию (А-Я)
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    
+    res = await session.execute(stmt)
+    
+    # Считаем всего стран
+    total = await session.scalar(select(func.count()).select_from(MemeCountry))
+    return res.scalars().all(), total

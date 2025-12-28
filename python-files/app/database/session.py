@@ -1,20 +1,35 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+# app/database/session.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
 import os
 
-# 1) Определяем абсолютный путь к файлу БД, чтобы он всегда создавался в папке database
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "playerstat.db")
+# Загружаем .env (на всякий случай, если запускаем не из главного файла)
+load_dotenv()
 
-# 2) Строка подключения с async-драйвером aiosqlite
-DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
+# Формируем URL из отдельных переменных
+POSTGRES_USER = os.getenv("POSTGRES_USER")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+POSTGRES_DB = os.getenv("POSTGRES_DB")
 
-# 3) Создаём асинхронный движок
-engine = create_async_engine(DATABASE_URL, echo=True)
+if not all([POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB]):
+    raise RuntimeError(
+        "Не заданы обязательные переменные окружения: "
+        "POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB. Проверь .env файл!"
+    )
 
-# 4) Фабрика асинхронных сессий (AsyncSession)
-async_session = sessionmaker(
+DATABASE_URL = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@localhost:5432/{POSTGRES_DB}"
+
+# Создаём асинхронный движок
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,  # Поставь True, если хочешь видеть SQL-запросы в логах (удобно для дебага)
+    future=True
+)
+
+# Фабрика сессий
+async_session = async_sessionmaker(
     bind=engine,
-    expire_on_commit=False,
-    class_=AsyncSession
+    class_=AsyncSession,
+    expire_on_commit=False
 )

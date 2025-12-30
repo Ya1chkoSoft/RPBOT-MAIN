@@ -6,3 +6,4 @@ aiohttp==3.10.10
 alembic==1.14.0
 thefuzz==0.22.1
 Levenshtein==0.26.0
+psycopg2-binary==2.9.11

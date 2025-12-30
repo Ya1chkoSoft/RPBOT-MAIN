@@ -1,7 +1,5 @@
-# app/countrycreate.py
 import html
-from aiogram import Router, types, F, Bot # 🔥 Убрали Text, добавили F и Bot
-from aiogram.filters import Command # 🔥 Оставили только Command
+from aiogram import Router, types, F, Bot 
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command, CommandObject
@@ -21,7 +19,6 @@ import logging
 # Устанавливаем КД в секундах (например, 7 дней)
 COUNTRY_CREATE_COOLDOWN = 7 * 24 * 60 * 60 # 604800 секунд
 
-# Импортируем твои DB-хендлеры (предполагаем, что они в .database.requests)
 from .database.requests import (
     get_or_create_user, 
     get_full_user_profile, 
@@ -57,89 +54,85 @@ class CountryCreateStates(StatesGroup):
 # ==========================================
 # A. ХЕНДЛЕР: НАЧАЛО /createcountry
 # ==========================================
-
 @country_create_router.message(Command("createcountry"))
 async def cmd_create_country(message: types.Message, state: FSMContext, session: AsyncSession, bot: Bot):
     user_id = message.from_user.id
     chat_id = message.chat.id
-    
-    # 0. ПРОВЕРКА ЧАТА 
-    if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        await message.answer("🚫 Эту команду можно использовать только в групповом чате.")
-        return
 
-    # 1. АВТО-РЕГИСТРАЦИЯ И ЗАГРУЗКА ПРОФИЛЯ
+    # Авторегистрация + профиль (вынесем отдельно, чтобы не мешать)
     profile, was_created = await db_ensure_full_user_profile(
         session=session,
         user_id=user_id,
         username=message.from_user.username or "Unknown",
         userfullname=message.from_user.full_name or "Unknown"
     )
-    
-    if was_created:
-        await message.answer("👋 Вы не были зарегистрированы, но я это исправил! Продолжаем создание...")
 
     if profile is None:
-        await message.answer("❌ Внутренняя ошибка: не удалось загрузить профиль. Попробуйте снова.")
+        await message.answer("❌ Внутренняя ошибка профиля.")
         return
 
-    # 2. ПРОВЕРКА КУЛДАУНА
-    if profile.last_country_creation:
-        time_since_creation = datetime.now() - profile.last_country_creation
-        
-        # NOTE: COUNTRY_CREATE_COOLDOWN должен быть определен где-то
-        if time_since_creation.total_seconds() < COUNTRY_CREATE_COOLDOWN:
-            remaining_seconds = COUNTRY_CREATE_COOLDOWN - time_since_creation.total_seconds()
-            remaining_time = str(timedelta(seconds=int(remaining_seconds)))
-            
-            error_text = (
-                f"⏳ <b>КУЛДАУН АКТИВЕН!</b>\n"
-                f"Новую страну можно создать через <b>{remaining_time}</b> (Д:Ч:М:С)."
-            )
-            await bot.send_message(chat_id=chat_id, text=error_text, parse_mode=ParseMode.HTML)
+    if was_created:
+        await message.answer("👋 Зарегистрировал тебя автоматически!")
+
+    # === ОСНОВНАЯ ЛОГИКА ЧЕРЕЗ MATCH-CASE ===
+    match (message.chat.type, profile.country_id is not None, profile.last_country_creation, await has_active_country_ban(session, user_id)):
+        # 1. Не в группе
+        case (chat_type, _, _, _) if chat_type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            await message.answer("🚫 Команда только в групповом чате.")
             return
 
-    # 3. ПРОВЕРКА ЧЛЕНСТВА
-    if profile.country:
-        country_safe = html.escape(profile.country.name)
-        error_text = (
-            f"🚫 Вы уже состоите в стране <b>{country_safe}</b>. "
-            "Выйдите командой /leave, чтобы создать новую."
-        )
-        await bot.send_message(chat_id=chat_id, text=error_text, parse_mode=ParseMode.HTML)
-        return
+        # 2. Уже в стране
+        case (_, True, _, _):
+            safe_name = html.escape(profile.country.name)
+            await bot.send_message(chat_id, f"🚫 Ты уже в стране <b>{safe_name}</b>. Выйди через /leave.", parse_mode="HTML")
+            return
 
-    # 4. СБОР ДАННЫХ ЧАТА (Имя, описание, флаг)
-    chat_info = await bot.get_chat(chat_id)
-    chat_name = chat_info.title
-    chat_desc = chat_info.description or f"Мемная страна, основанная в чате '{chat_name}'."
-    chat_name_safe = html.escape(chat_name)
-    
-    flag_url = None
-    try:
-        if chat_info.photo:
-            flag_url = chat_info.photo.big_file_id
-    except Exception as e:
-        logger.warning(f"Не удалось получить фото чата {chat_id}: {e}")
-    
-    # 5. СОХРАНЯЕМ НАЧАЛЬНЫЕ ДАННЫЕ В FSM
-    await state.update_data(
-        chat_id=chat_id,
-        name=chat_name, 
-        description=chat_desc,
-        flag_url=flag_url,
-    )
-    
-    # 6. НАЧИНАЕМ FSM (переход к первому шагу: memename)
-    await state.set_state(CountryCreateStates.memename) 
-    
-    await message.answer(
-        f"📝 <b>Начинаем создание страны: {chat_name_safe}</b>\n"
-        "Название, описание и флаг взяты из настроек чата.\n"
-    "Шаг 1 из 3: Введите <b>МЕМ ВАШЕЙ СТРАНЫ</b> (основу) страны.\n",
-        parse_mode=ParseMode.HTML
-    )
+        # 3. Активный бан на создание
+        case (_, _, _, True):
+            await message.reply("❌ У тебя активный бан на создание стран.")
+            return
 
+        # 4. Кулдаун активен
+        case (_, _, last_creation, _) if last_creation and (datetime.now() - last_creation).total_seconds() < COUNTRY_CREATE_COOLDOWN:
+            remaining = str(timedelta(seconds=int(COUNTRY_CREATE_COOLDOWN - (datetime.now() - last_creation).total_seconds())))
+            await bot.send_message(chat_id, f"⏳ Кулдаун! Жди <b>{remaining}</b>", parse_mode="HTML")
+            return
+
+        # 5. Всё ок — запускаем создание
+        case _:
+            # Собираем данные чата
+            chat_info = await bot.get_chat(chat_id)
+            chat_name = chat_info.title or "Без названия"
+            chat_desc = chat_info.description or f"Мемная страна в чате '{chat_name}'."
+            flag_url = chat_info.photo.big_file_id if chat_info.photo else None
+
+            await state.update_data(
+                chat_id=chat_id,
+                name=chat_name,
+                description=chat_desc,
+                flag_url=flag_url,
+            )
+
+            await state.set_state(CountryCreateStates.memename)
+            await message.answer(
+                f"📝 <b>Создаём страну: {html.escape(chat_name)}</b>\n"
+                "Шаг 1/3: Введите <b>МЕМ</b> вашей страны (основу).\n",
+                parse_mode="HTML"
+            )
+            return
+
+async def has_active_country_ban(session: AsyncSession, user_id: int) -> bool:
+    result = await session.scalar(
+        select(Punishment)
+        .where(Punishment.user_id == user_id)
+        .where(Punishment.action_type == "COUNTRY_CREATION_BAN")
+        .where(Punishment.is_active == True)
+    )
+    if result:
+        if result.expires_at is None or result.expires_at > datetime.utcnow():
+            return True
+        result.is_active = False  # истёк
+    return False
 # ==========================================
 # B. ХЕНДЛЕР FSM: 1/3 Ввод Мема Страны
 # ==========================================

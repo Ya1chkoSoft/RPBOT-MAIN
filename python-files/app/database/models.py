@@ -107,6 +107,9 @@ class MemeCountry(Base):
     avg_rating: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     total_reviews: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    tax_rate: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    treasury: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+
     blacklist: Mapped[List["CountryBlacklist"]] = relationship("CountryBlacklist", back_populates="country", lazy="selectin")
 
     ruler: Mapped["User"] = relationship("User", back_populates="ruled_country_list", foreign_keys=[ruler_id])

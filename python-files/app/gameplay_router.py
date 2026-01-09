@@ -1,3 +1,6 @@
+"""
+Маршрутизатор для игровых функций: рейтинг стран, голосование и т.д.
+"""
 import math
 from aiogram import Router, types, F
 from aiogram.filters import Command
@@ -76,10 +79,15 @@ async def on_join_click(call: types.CallbackQuery, session: AsyncSession):
     country_id = int(call.data.split(":")[1])
     user_id = call.from_user.id
     
-    success, msg = await join_country(session, user_id, country_id)
+    # Используем правильный формат join_country
+    success, msg = await join_country(
+        session=session,
+        user_id=user_id,
+        search_method="id",
+        search_value=str(country_id)
+    )
     
     if success:
-        await session.commit()
         await call.message.answer(f"✅ **Успешно!** {msg}", parse_mode=ParseMode.MARKDOWN)
     else:
         await call.answer(f"🚫 {msg}", show_alert=True)
@@ -134,10 +142,7 @@ async def on_vote_click(call: types.CallbackQuery, session: AsyncSession):
 
     try:
         await save_review(session, user_id, country_id, rating)
-        await session.commit()
-        
         await call.message.edit_text(f"✅ Вы поставили **{rating} ⭐**!\nСпасибо за гражданскую позицию.")
         await call.answer("Голос принят!")
     except Exception as e:
-        await session.rollback()
         await call.answer("Ошибка при голосовании :(", show_alert=True)

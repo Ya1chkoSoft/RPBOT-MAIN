@@ -4,7 +4,6 @@ from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
 import os
 
-# Загружаем .env (на всякий случай, если запускаем не из главного файла)
 load_dotenv()
 
 # Формируем URL из отдельных переменных

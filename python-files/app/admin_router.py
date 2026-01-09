@@ -11,14 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import User, Admins, History, Punishment
 from app.filters import IsRPAdmin, IsCountryRuler
+from app.utils.html_helpers import escape_html
 from config import OWNER_ID
 
 admin_router = Router()
 
-# ==================== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ====================
-def escape_html(text: str) -> str:
-    """Безопасное экранирование для HTML"""
-    return html.escape(str(text), quote=False)
 
 
 # ==================== РП НАЗНАЧИТЬ ====================
@@ -210,7 +207,7 @@ async def list_admins(message: Message, session: AsyncSession):
         await message.reply("\n".join(lines))
 
     except Exception as e:
-        print(f"[ADMIN LIST ERROR] {e}")
+        logger.error(f"[ADMIN LIST ERROR] {e}")
         await message.reply("❌ Ошибка при получении списка админов.")
 
 
@@ -307,6 +304,7 @@ async def handle_give_points(message: Message, session: AsyncSession):
         session.add(History(
             admin_id=caller_id,
             target_id=target_user.user_id,
+            event_type="admin_give",
             points=points,
             reason=reason,
             timestamp=datetime.now()
@@ -326,7 +324,7 @@ async def handle_give_points(message: Message, session: AsyncSession):
         )
 
     except Exception as e:
-        print(f"[GIVE POINTS ERROR] {e}")
+        logger.error(f"[GIVE POINTS ERROR] {e}")
         await message.reply("❌ Ошибка при начислении очков.")
 
 # ==================== РП ИСТОРИЯ (ПОСЛЕДНИЕ ДЕЙСТВИЯ) ====================
@@ -372,11 +370,11 @@ async def admin_history(message: Message, session: AsyncSession):
         await message.reply("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
-        print(f"[HISTORY ERROR] {e}")
+        logger.error(f"[HISTORY ERROR] {e}")
         await message.reply("❌ Ошибка при получении истории.")
 
 # ========================================================
-# Наказания
+# БАНИРОВАНИЕ НА СОЗДАНИЕ СТРАН (/rpbancreate)
 # ========================================================
 @admin_router.message(Command("rpbancreate"), IsRPAdmin())
 async def ban_country_create(message: Message, session: AsyncSession, command: CommandObject):
@@ -404,9 +402,10 @@ async def ban_country_create(message: Message, session: AsyncSession, command: C
             # Если реплая нет, ищем по аргументам: /rpbancreate <id/@user> [время] [причина]
             args = command.args.split() if command.args else []
             if len(args) < 1:
-                # Починил: экранируем подсказку, чтобы не было ошибки "Unsupported start tag"
-                prompt = "❗ Формат:\nРеплай: /rpbancreate [время] [причина]\nТекст: /rpbancreate <user_id/@user> [время] [причина]"
-                await message.reply(escape_html(prompt), parse_mode="HTML")
+                await message.answer(
+                    escape_html("❗ Формат: Реплай: /rpbancreate [время] [причина] | Text: /rpbancreate <user_id/@user> [время] [причина]"),
+                    parse_mode="HTML"
+                )
                 return
 
             target_str = args[0]
@@ -425,7 +424,7 @@ async def ban_country_create(message: Message, session: AsyncSession, command: C
                     reason = " ".join(args[1:])
 
         if not target_user:
-            await message.reply("❌ Пользователь не найден в базе данных.")
+            await message.answer("❌ Пользователь не найден в базе данных.")
             return
 
         # 2. Создание наказания
@@ -455,6 +454,200 @@ async def ban_country_create(message: Message, session: AsyncSession, command: C
         )
 
     except Exception as e:
-        print(f"[BAN COUNTRY CREATE ERROR] {e}")
+        logger.error(f"[BAN COUNTRY CREATE ERROR] {e}")
         await message.reply("❌ Произошла ошибка при обработке команды.")
 
+# ========================================================
+# СНЯТИЕ БАНА НА СОЗДАНИЕ СТРАН (/rpunban)
+# ========================================================
+@admin_router.message(Command("rpunban"), IsRPAdmin())
+async def unban_country_create(
+    message: Message,
+    session: AsyncSession,
+    command: CommandObject
+):
+    try:
+        target_user: User | None = None
+
+        # ----------------------------------------
+        # Определяем цель (reply или аргументы)
+        # ----------------------------------------
+        if message.reply_to_message:
+            target_user_id = message.reply_to_message.from_user.id
+
+            result = await session.execute(
+                select(User).where(User.user_id == target_user_id)
+            )
+            target_user = result.scalar_one_or_none()
+
+        else:
+            args = command.args.split() if command.args else []
+            if not args:
+                await message.answer(
+                    "❗ Формат: реплай на пользователя или /rpunban <user_id | @username>"
+                )
+                return
+
+            target = args[0]
+
+            if target.isdigit():
+                stmt = select(User).where(User.user_id == int(target))
+            else:
+                username = target.lstrip("@")
+                stmt = select(User).where(
+                    func.lower(User.username) == username.lower()
+                )
+
+            result = await session.execute(stmt)
+            target_user = result.scalar_one_or_none()
+
+        if not target_user:
+            await message.answer("❌ Пользователь не найден.")
+            return
+
+        # ----------------------------------------
+        # Снимаем ТОЛЬКО ОДИН активный бан (последний)
+        # ----------------------------------------
+        subquery = (
+            select(Punishment.id)
+            .where(
+                Punishment.user_id == target_user.user_id,
+                Punishment.action_type == "COUNTRY_CREATION_BAN",
+                Punishment.is_active.is_(True),
+            )
+            .order_by(desc(Punishment.created_at))
+            .limit(1)
+            .scalar_subquery()
+        )
+
+        result = await session.execute(
+            update(Punishment)
+            .where(Punishment.id == subquery)
+            .values(
+                is_active=False,
+                updated_at=func.now(),  # если поля нет — можешь убрать
+            )
+        )
+
+        if result.rowcount == 0:
+            await message.reply("❌ Активный бан на создание стран не найден.")
+            return
+
+        safe_name = escape_html(
+            target_user.userfullname
+            or f"@{target_user.username}"
+            or "Без имени"
+        )
+
+        await message.reply(
+            f"✅ <b>Бан снят!</b>\n"
+            f"👤 Пользователь: {safe_name}\n"
+            f"🆔 ID: <code>{target_user.user_id}</code>\n"
+            f"Теперь может создавать страны.",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logger.exception("[RPUNBAN ERROR]")
+        await message.reply("❌ Произошла ошибка при снятии бана.")
+
+
+
+# ========================================================
+# СПИСОК АКТИВНЫХ НАКАЗАНИЙ (/punishments)
+# ========================================================
+@admin_router.message(Command("punishments"), IsRPAdmin())
+async def list_punishments(
+    message: Message,
+    session: AsyncSession
+):
+    try:
+        stmt = (
+            select(
+                Punishment.user_id,
+                Punishment.action_type,
+                Punishment.reason,
+                Punishment.created_at,
+                User.userfullname,
+                User.username,
+            )
+            .join(User, User.user_id == Punishment.user_id)
+            .where(Punishment.is_active.is_(True))
+            .order_by(desc(Punishment.created_at))
+            .limit(10)
+        )
+
+        result = await session.execute(stmt)
+        rows = result.all()
+
+        if not rows:
+            await message.reply("📭 Активных наказаний нет.")
+            return
+
+        lines = ["<b>📜 Активные наказания:</b>\n"]
+
+        for user_id, action, reason, created_at, fullname, username in rows:
+            safe_name = escape_html(fullname or username or "NoName")
+            safe_reason = escape_html(reason or "Без причины")
+
+            lines.append(
+                f"• {safe_name} (ID: <code>{user_id}</code>) — <b>{action}</b>\n"
+                f"  <i>{safe_reason}</i> ({created_at:%d.%m})"
+            )
+
+        await message.reply("\n".join(lines), parse_mode="HTML")
+
+    except Exception as e:
+        logger.exception("[LIST PUNISHMENTS ERROR]")
+        await message.reply("❌ Ошибка при получении списка наказаний.")
+
+# ========================================================
+# СБРОС КУЛДАУНА НА СОЗДАНИЕ СТРАН (/resetcd)
+# ========================================================
+@admin_router.message(Command("resetcd"), IsRPAdmin())
+async def reset_country_cooldown(message: Message, session: AsyncSession, command: CommandObject):
+    try:
+        target_user = None
+        
+        # 1. Логика определения цели (Реплай vs Аргументы)
+        if message.reply_to_message:
+            target_user_id = message.reply_to_message.from_user.id
+            result = await session.execute(select(User).where(User.user_id == target_user_id))
+            target_user = result.scalar_one_or_none()
+        else:
+            args = command.args.split() if command.args else []
+            if len(args) < 1:
+                await message.answer(
+                    "❗ Формат: Реплай на сообщение или <code>/resetcd &lt;user_id/@user&gt;</code>",
+                    parse_mode="HTML"
+                )
+                return
+
+            target_str = args[0]
+            if target_str.isdigit():
+                result = await session.execute(select(User).where(User.user_id == int(target_str)))
+            else:
+                username = target_str.lstrip("@")
+                result = await session.execute(select(User).where(func.lower(User.username) == username.lower()))
+            target_user = result.scalar_one_or_none()
+
+        if not target_user:
+            await message.answer("❌ Пользователь не найден в базе данных.")
+            return
+
+        # 2. Сброс кулдауна (очищаем дату последнего создания)
+        target_user.last_country_creation = None
+
+        # 3. Ответ
+        safe_name = escape_html(target_user.userfullname or f"@{target_user.username or 'unknown'}")
+        await message.reply(
+            f"⚡️ <b>Кулдаун сброшен</b>\n\n"
+            f"👤 Пользователь: {safe_name}\n"
+            f"🆔 ID: <code>{target_user.user_id}</code>\n"
+            f"✅ Теперь он может снова основать страну!",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logger.error(f"[RESET CD ERROR] {e}")
+        await message.reply("❌ Ошибка при сбросе кулдауна.")

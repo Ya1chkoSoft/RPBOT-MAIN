@@ -25,6 +25,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import User, Admins, History
 from app.database.session import async_session
+from app.utils.html_helpers import escape_html
 from datetime import datetime
 
 import app.database.requests as rq
@@ -70,28 +71,29 @@ def escape_html(text: str) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, session: AsyncSession):
-    # 1. Вызываем функцию для получения/создания пользователя
+    # Используем твой хелпер (миддлварь сама закоммитит изменения)
     await get_or_create_user(
         session=session,
         user_id=message.from_user.id,
         username=message.from_user.username or "",
         userfullname=message.from_user.full_name
     )
-    try:
-        # Без этого вызова, все изменения (INSERT/UPDATE) будут откачены (ROLLBACK)
-        await session.commit()
-    except Exception as e:
-        # Логирование и откат при ошибке COMMIT
-        await session.rollback()
-        # В реальном приложении здесь лучше использовать logger.error(f"Commit error: {e}")
-        print(f"Ошибка при COMMIT: {e}") 
-        
-    # 3. Ответ пользователю
+    
+    # Безопасно готовим имя пользователя
+    user_name = escape_html(message.from_user.full_name)
+    
+    # Исправленный текст (убран лишний </b> в конце)
+    welcome_text = (
+        f"<b>ПРИВЕТСТВУЮ, {user_name}, В НАШЕМ РП БОТЕ</b>\n"
+        "<i>версия бота 3.5</i>\n\n"
+        "<b>ВНИМАНИЕ ЭТО БЕТА ТЕСТ, БОТ МОЖЕТ БЫТЬ НЕСТАБИЛЬНЫМ!</b>\n"
+        "данный бот будет помогать вам в рп и тд :3\n"
+        "ниже будет располагаться меню, желаем вам удачи\n"
+        "если вы увидели ошибку, то пишите администратору — <code>@Ya1chko</code>"
+    )
+
     await message.answer(
-        """<b>ПРИВЕТСТВУЮ В НАШЕМ РП БОТЕ</b>
-<i>версия бота 3.2</i>
-данный бот будет помогать вам в рп и тд:3
-ниже будет распологаться меню, желаем вам удачи""",
+        welcome_text,
         parse_mode='HTML',
         reply_markup=kb.main
     )
@@ -186,7 +188,6 @@ async def transfer_points(message: Message, session: AsyncSession):
         receiver.points += amount
 
         session.add_all([sender, receiver])
-        await session.commit()
 
         await message.reply(
             f"💸 {amount} очков успешно переведено!\n"
@@ -204,12 +205,12 @@ SLOTS_PATH = os.path.join(BASE_DIR, "assets", "slots")
 
 @router.message(F.text.lower().startswith("рп казино"))
 async def casino(message: Message, session: AsyncSession):
+    # --- Блок Валидации Входящих Данных ---
     args = message.text.strip().split()
     if len(args) < 3:
         await message.reply("❗ Формат: <code>рп казино &lt;ставка&gt;</code>", parse_mode='HTML')
         return
 
-    # 1. Извлекаем и проверяем ставку
     bet_str = args[2] 
     if not bet_str.isdigit() or int(bet_str) <= 0:
         await message.reply("❗ Ставка должна быть положительным числом.", parse_mode='HTML')
@@ -217,29 +218,31 @@ async def casino(message: Message, session: AsyncSession):
         
     bet = int(bet_str)
     user_id = message.from_user.id
-    
-    # 2. Получение пользователя и проверка баланса
-    user_result = await session.execute(select(User).where(User.user_id == user_id))
-    user = user_result.scalar_one_or_none()
 
-    if not user:
-        await message.reply("❌ Вы не зарегистрированы в системе. Используйте /start.", parse_mode='HTML') 
-        return
+    user = await get_or_create_user(
+        session=session, 
+        user_id=user_id, 
+        username=message.from_user.username, 
+        userfullname=message.from_user.full_name
+    )
+
+    # --- Блок Бизнес-Логики ---
     if user.points < bet:
         await message.reply("🚫 У вас недостаточно очков для этой ставки.", parse_mode='HTML') 
         return
 
-    await asyncio.sleep(1.0) # Задержка 1.0 секунды
-
-    # 4. Снятие ставки
+    # Списываем сразу (объект в памяти обновлен, сессия это запомнила)
     user.points -= bet
+    
+    # Визуальный эффект (можно оставить, но лучше не злоупотреблять sleep в async)
+    await asyncio.sleep(1.0) 
 
-    # 5. Крутим слоты (логика остаётся прежней)
+    # Крутим слоты
     slot1 = random.choices(SLOT_SYMBOLS, weights=SYMBOL_WEIGHTS, k=1)[0]
     slot2 = random.choices(SLOT_SYMBOLS, weights=SYMBOL_WEIGHTS, k=1)[0]
     slot3 = random.choices(SLOT_SYMBOLS, weights=SYMBOL_WEIGHTS, k=1)[0]
 
-    # 6. Расчет выигрыша (логика остаётся прежней)
+    # Расчет (твоя логика без изменений)
     winnings = 0
     final_multiplier = 0.0
     winning_symbol = None
@@ -247,45 +250,29 @@ async def casino(message: Message, session: AsyncSession):
 
     if slot1 == slot2 == slot3:
         winning_symbol = slot1
-        # Логика джекпота
         final_multiplier = SYMBOL_MULTIPLIERS[winning_symbol] * 3.0
-        win_message = f"✨ Джекпот! Три одинаковых символа:"
-            
+        win_message = "✨ Джекпот! Три одинаковых символа:"
     elif slot1 == slot2 or slot2 == slot3 or slot1 == slot3:
         if slot1 == slot2: winning_symbol = slot1
         elif slot2 == slot3: winning_symbol = slot2
         elif slot1 == slot3: winning_symbol = slot1
-            
         final_multiplier = SYMBOL_MULTIPLIERS[winning_symbol]
         win_message = "🎉 Поздравляем! Два одинаковых символа:"
         
     if final_multiplier > 0:
         winnings = int(bet * final_multiplier)
-        user.points += winnings
+        user.points += winnings # SQLAlchemy следит за этим изменением
 
-    # 7. Обновление БД и запись истории
-    session.add(user) 
-    
+    # --- Запись в историю ---
     history = History(
-        admin_id=message.from_user.id,
-        target_id=user.user_id,
+        admin_id=user_id, # Тут админ и таргет совпадают, это ок
+        target_id=user_id,
+        event_type="CASINO_GAME",
         points=winnings if winnings > 0 else -bet, 
         reason="Казино: Слоты",
         timestamp=datetime.now()
     )
     session.add(history)
-    
-    # 8. 🛑 ФИКСАЦИЯ: COMMIT! Гарантируем сохранение.
-    try:
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        # 🔥 ИЗМЕНЕНИЕ: Отправляем новое сообщение об ошибке, так как старое не существует
-        await message.reply(
-            f"❌ Критическая ошибка БД при игре в слоты. Ставка отменена: <code>{escape_html(str(e))}</code>", 
-            parse_mode='HTML'
-        )
-        return
 
     # 9. Формирование финального сообщения
     safe_points = escape_html(f"{user.points}")
@@ -323,22 +310,11 @@ async def casino(message: Message, session: AsyncSession):
 
     if chosen_gif:
         gif_path = os.path.join(SLOTS_PATH, chosen_gif)
-        
-        with open(gif_path, "rb") as gif_file:
-            animation_file = FSInputFile(gif_path)
-            
-            # 🔥 Отправляем GIF с результатом
-            await message.reply_animation(
-                animation_file,
-                caption=caption_text,
-                parse_mode='HTML'
-            )
+        animation_file = FSInputFile(gif_path)
+        await message.reply_animation(animation_file, caption=caption_text, parse_mode='HTML')
     else:
-        # Если GIF не найден, отправляем просто текст
-        await message.reply(
-            f"🚨 Нет GIF-файлов.\n\n{caption_text}", 
-            parse_mode='HTML'
-        )
+        await message.reply(caption_text, parse_mode='HTML')
+
 
 # --- СЛОТЫ 3x3 ---
 def spin_slots():
@@ -383,62 +359,52 @@ def get_winning_lines(slots):
 # ==========================================
 # 🎰 ХЕНДЛЕР: РП СЛОТЫ (3x3)
 # ==========================================
-
 @router.message(F.text.lower().startswith("рп слоты"))
-@router.message(Command("slot")) # Поддержка текстового триггера и команды /slot
+@router.message(Command("slot"))
 async def slot_machine(message: Message, session: AsyncSession):
-    
-    # 1. Парсинг аргументов и проверка ставки
+    # --- 1. Валидация ---
     args = message.text.strip().split()
-    
-    # Проверка формата: "рп слоты <ставка>" или "/slot <ставка>"
-    if len(args) < 2 and not message.text.startswith("/"):
+    if len(args) < 2:
         await message.reply("❗ Формат: <code>рп слоты &lt;ставка&gt;</code>", parse_mode='HTML')
         return
     
-    # Извлекаем ставку (последний аргумент)
-    bet_str = args[-1] 
-    
-    if not bet_str.isdigit():
-        await message.reply("❗ Ставка должна быть числом.", parse_mode='HTML')
+    bet_str = args[-1]
+    if not bet_str.isdigit() or int(bet_str) <= 0:
+        await message.reply("❗ Ставка должна быть положительным числом.", parse_mode='HTML')
         return
 
     bet = int(bet_str)
-    if bet <= 0:
-        await message.reply("❗ Ставка должна быть больше нуля.", parse_mode='HTML')
-        return
-
     user_id = message.from_user.id
 
-    # 2. Получение пользователя и проверка баланса
-    user_result = await session.execute(select(User).where(User.user_id == user_id))
-    user = user_result.scalar_one_or_none()
+    # --- 2. Получение юзера ---
+    user = await get_or_create_user(
+        session=session,
+        user_id=user_id,
+        username=message.from_user.username,
+        userfullname=message.from_user.full_name
+    )
 
-    if not user:
-        await message.reply("❌ Вы не зарегистрированы. Используйте /start.", parse_mode='HTML')
-        return
-    
+    # --- 3. Проверка баланса ---
     if user.points < bet:
         await message.reply("🚫 У вас недостаточно очков для этой ставки.", parse_mode='HTML')
         return
 
-    # Обновляем время последнего использования (оставлено для корректной работы user-модели)
+    # --- 4. Старт игры ---
     if hasattr(user, 'last_slot_time'):
         user.last_slot_time = datetime.now()
 
-    # 4. Списываем ставку
     user.points -= bet 
-    
-    # 5. Искусственная задержка (имитация анимации)
-    await asyncio.sleep(0.01)
+    await asyncio.sleep(0.01) # Микро-задержка для ощущения процесса
 
-    # 6. Запуск логики и расчет выигрыша
-    # Убедитесь, что spin_slots() в app/casino.py использует SLOT3X3_SYMBOLS/WEIGHTS
-    slots = spin_slots() 
+    slots = [
+        random.choices(SLOT3X3_SYMBOLS, weights=SLOT3X3_WEIGHTS, k=3) 
+        for _ in range(3)
+    ]
     
-    # Случайный множитель удачи (например, от 0.8x до 1.2x)
+    # Глобальный множитель удачи (можно вынести в конфиг, если хочешь)
     global_multiplier = round(random.uniform(0.8, 1.2), 2)
     
+    # Проверяем линии (предполагаем, что эта функция умеет работать с матрицей 3x3)
     winning_lines = get_winning_lines(slots)
 
     total_winnings = 0
@@ -446,11 +412,11 @@ async def slot_machine(message: Message, session: AsyncSession):
     
     if winning_lines:
         for symbol, line_name, line_mult in winning_lines:
-            
-            #Теперь используется SLOT3X3_MULTIPLIERS
+            # 🔥 БЕРЕМ МНОЖИТЕЛЬ ИЗ ТВОЕГО КОНФИГА
+            # Если символа нет в конфиге (баг), вернем 0
             symbol_val = SLOT3X3_MULTIPLIERS.get(symbol, 0)
             
-            # Формула выигрыша: Ставка * Ценность символа * Глобальная удача
+            # Считаем выигрыш
             line_win = int(bet * symbol_val * global_multiplier)
 
             lines_text += (f"🏆 {escape_html(line_name)} ({escape_html(symbol)}): "
@@ -467,30 +433,19 @@ async def slot_machine(message: Message, session: AsyncSession):
     else:
         result_text = f"❌ Увы, вы проиграли <b>{bet}</b> очков.\n💸 Всё ушло админу 😉"
 
-    # 7. Транзакция в БД и COMMIT
-    try:
-        history = History(
-            admin_id=user_id,
-            target_id=user.user_id,
-            points=(total_winnings if total_winnings > 0 else -bet),
-            reason="Казино: Слоты",
-            timestamp=datetime.now()
-        )
-        session.add(history)
-        session.add(user) # Сохраняем пользователя (включая last_slot_time)
-        await session.commit()
-    
-    # 💥 ОТКАТ ТРАНЗАКЦИИ при ошибке
-    except Exception as e:
-        await session.rollback()
-        logger.exception("Ошибка БД при слотах, возвращаем ставку: %s", e)
-        user.points += bet # 🛑 ВОЗВРАТ СТАВКИ
-        
-        await message.reply(f"❌ Критическая ошибка БД! Ставка <b>{bet}</b> очков возвращена.", parse_mode='HTML')
-        return
+    # --- 6. Запись истории ---
+    history = History(
+        admin_id=user_id,
+        target_id=user.user_id,
+        event_type="SLOT_GAME",
+        points=(total_winnings if total_winnings > 0 else -bet),
+        reason="Казино: Слоты 3x3",
+        timestamp=datetime.now()
+    )
+    session.add(history)
 
-    # 8. Формирование финального сообщения
-    safe_field = escape_html(format_slots(slots))
+    # --- 7. Подготовка ответа (View) ---
+    safe_field = escape_html(format_slots(slots)) # format_slots должна уметь красиво рисовать 3x3
     safe_balance = escape_html(str(user.points))
 
     html_output = (
@@ -500,43 +455,24 @@ async def slot_machine(message: Message, session: AsyncSession):
         f"💰 Баланс: <b>{safe_balance}</b> очков."
     )
     
-    # 9. Отправка GIF + подпись
+    # --- 8. Выбор и отправка GIF ---
     slot_gifs = []
     chosen_gif = None
-
     try:
         if os.path.exists(SLOTS_PATH):
             all_gifs = [f for f in os.listdir(SLOTS_PATH) if f.endswith(".gif")]
-            # Фильтр по "slot" (если нужно, иначе используйте all_gifs)
             slot_gifs = [f for f in all_gifs if f.startswith("slot")] 
-            
             if slot_gifs:
                 chosen_gif = random.choice(slot_gifs)
     except Exception as e:
-        logger.warning("Ошибка чтения ассетов слотов: %s", e)
+        logger.warning(f"GIF Error: {e}")
     
     if chosen_gif:
         gif_path = os.path.join(SLOTS_PATH, chosen_gif)
-        try:
-            animation_file = FSInputFile(gif_path)
-            # 🚨 ОТПРАВЛЯЕМ GIF с финальной подписью
-            await message.reply_animation(
-                animation_file, 
-                caption=html_output,
-                parse_mode='HTML'
-            )
-            return 
-        except Exception as e:
-            logger.error("Ошибка при отправке GIF: %s. Отправляем текстом.", e)
-            
-    # 10. Фоллбэк (Только текст)
-    prefix = ""
-    if not os.path.exists(SLOTS_PATH):
-        prefix = f"🚨 Папка ассетов не найдена: <code>{SLOTS_PATH}</code>\n\n"
-    elif chosen_gif:
-        prefix = "🚨 Ошибка отправки GIF. Результат текстом:\n\n"
-        
-    await message.reply(f"{prefix}{html_output}", parse_mode='HTML')
+        animation_file = FSInputFile(gif_path)
+        await message.reply_animation(animation_file, caption=html_output, parse_mode='HTML')
+    else:
+        await message.reply(html_output, parse_mode='HTML')
 
 #Проверка что бот работает - - - - - - - - - - - - -
 @router.message(Command("ping"))
@@ -574,23 +510,12 @@ async def randomizer1(message: Message, session: AsyncSession):
     if text in ('рп профиль', 'рп топ'):
         
         # Гарантируем, что пользователь существует в БД перед запросом его данных
-        try:
-            await get_or_create_user(
-                session=session,
-                user_id=message.from_user.id,
-                username=message.from_user.username or "",
-                userfullname=message.from_user.full_name
-            )
-            
-            # 🚀 ФИКСИРУЕМ изменения (если пользователь был создан/обновлен)
-            await session.commit()
-            
-        except Exception as e:
-            # Откат в случае ошибки
-            await session.rollback()
-            print(f"Ошибка при сохранении пользователя или COMMIT: {e}") 
-            # Не прерываем выполнение, чтобы попытаться хотя бы прочитать данные
-            
+        await get_or_create_user(
+            session=session,
+            user_id=message.from_user.id,
+            username=message.from_user.username or "",
+            userfullname=message.from_user.full_name
+        )
         
         # 2.2. Обработка 'рп профиль'
         if text == 'рп профиль':
@@ -699,11 +624,53 @@ async def defrpcommandsbutton(callback: CallbackQuery):
 женщина,мужчина - угар комманды
 РП профиль - ваш профиль в меном мире:
 рп топ - то РП игроков
-рп админы - список администраторов''',
+рп админы - список администраторов
+''',
         parse_mode='HTML',
         reply_markup=kb.main
     )
+@router.callback_query(F.data == 'countrycommandbt')
+async def defcountrycommandsbutton(callback: CallbackQuery):
+    await callback.answer('успешно')
+    text = (
+        "<b>🌍 СОЗДАНИЕ И УПРАВЛЕНИЕ СТРАНОЙ</b>\n\n"
+        "<b>1. Как основать страну:</b>\n"
+        "Добавьте бота в чат будущей страны и пропишите <code>/createcountry</code>. "
+        "Следуйте инструкциям в чате страны.\n\n"
+        
+        "<b>2. Команды для граждан:</b>\n"
+        "• <code>/join [ID/Название]</code> — вступить в страну\n"
+        "• <code>/leave</code> — покинуть текущую страну\n"
+        "• <code>/mycountry</code> — профиль вашей страны\n"
+        "• <code>/rate [1-5]</code> — оценить страну\n"
+        "• <code>/donate [сумма]</code> — пожертвовать очки в казну\n\n"
+        
+        "<b>3. Команды правителя (Администрирование):</b>\n"
+        "• <code>/transferruler [ID/@user]</code> — передать трон\n"
+        "• <code>/setposition [должность] [ID/@user]</code> — назначить должность\n"
+        "• <code>/kick [ID/@user]</code> — выгнать из страны\n"
+        "• <code>/settax [0-50]</code> — установить налог (%)\n"
+        "• <code>/collect</code> — собрать налоги\n"
+        "• <code>/deletecountry</code> — <b>удалить страну навсегда</b>\n\n"
+        
+        "<b>4. Редактирование страны:</b>\n"
+        "• <code>/editcountry</code> — интерактивное редактирование\n"
+        "• <code>/setname [название]</code> — изменить название\n"
+        "• <code>/setideology [идеология]</code> — изменить идеологию\n"
+        "• <code>/setdescription [описание]</code> — изменить описание\n"
+        "• <code>/setmap [ссылка]</code> — изменить карту\n"
+        "• <code>/setflag</code> — изменить флаг (ответом на фото)\n\n"
+        
+        "<b>5. Общая информация:</b>\n"
+        "• <code>/globalstats</code> — топ стран по влиянию\n"
+        "• <code>/countrylist [стр]</code> — список всех стран мира"
+    )
 
+    await callback.message.edit_text(
+        text,
+        parse_mode='HTML',
+        reply_markup=kb.main
+    )
 
 # Слова для обработки которые ищем в сообщении и ответы
 responses = {

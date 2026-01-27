@@ -10,21 +10,20 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ------------------------------------------------------------
 def generate_symbols_data(symbols, base_mult, mult_step, base_weight, weight_step):
-    """
-    Генерирует множители и веса для слотов на основе заданных параметров.
-    """
     multipliers = {}
     weights = []
     
-    # Применяем коэффициенты к каждому символу по порядку
+    # Берем модуль, чтобы если ты ночью впишешь -1.8, всё не взорвалось
+    div = max(1.05, abs(weight_step))
+
     for i, sym in enumerate(symbols):
-        # Множитель растет: base + step * index
-        multipliers[sym] = base_mult + mult_step * i
+        # Множители делаем красивые: 0.8, 1.4, 2.0...
+        m = base_mult + (mult_step * i)
+        multipliers[sym] = round(m, 2)
         
-        # Вес падает (реже выпадает): base + step * index
-        # Используем max(1, ...) чтобы вес всегда был минимум 1.
-        weight = max(1, base_weight + weight_step * i) 
-        weights.append(base_weight / (weight_step ** i))
+        # Веса падают мягко: 100, 55, 30, 17, 9, 5
+        w = base_weight / (div ** i)
+        weights.append(round(max(0.1, w), 2))
         
     return multipliers, weights
 
@@ -73,17 +72,17 @@ def get_standard_settings() -> dict:
 
         # --- Настройки Казино (Параметры для 1x3) ---
         "SLOT_SYMBOLS": '["🍒", "🍋", "🦷", "⭐", "👼🏿"]', # Храним как строку, чтобы легко читать из TXT
-        "CASINO_BASE_MULT": 2.0,
-        "CASINO_MULT_STEP": 1.0,
-        "CASINO_BASE_WEIGHT": 30,
-        "CASINO_WEIGHT_DIVISOR": 2.5,
+        "CASINO_BASE_MULT": 1.2,
+        "CASINO_MULT_STEP": 1.5,
+        "CASINO_BASE_WEIGHT": 50,
+        "CASINO_WEIGHT_DIVISOR": 2.8,
         
         #Настройки Казино (Параметры для 3x3)
-        "SLOT3X3_SYMBOLS": '["🟡", "🟢", "🔴", "💎"]',
-        "SLOT3X3_BASE_MULT": 1.0,                    
+        "SLOT3X3_SYMBOLS": ["🎸", "👼🏿", "🐸", "✅", "🚹"],
+        "SLOT3X3_BASE_MULT": 0.8,                    
         "SLOT3X3_MULT_STEP": 2.0,                    
-        "SLOT3X3_BASE_WEIGHT": 40,                   
-        "SLOT3X3_WEIGHT_STEP": -15,                  
+        "SLOT3X3_BASE_WEIGHT": 100,                   
+        "SLOT3X3_WEIGHT_STEP": 3.5,                  
     }
 
 # ------------------------------------------------------------
@@ -179,5 +178,5 @@ SLOT3X3_MULTIPLIERS, SLOT3X3_WEIGHTS = generate_symbols_data(
     base_mult=float(CONFIG["SLOT3X3_BASE_MULT"]),
     mult_step=float(CONFIG["SLOT3X3_MULT_STEP"]),
     base_weight=int(CONFIG["SLOT3X3_BASE_WEIGHT"]),
-    weight_step=int(CONFIG["SLOT3X3_WEIGHT_STEP"])
+    weight_step=float(CONFIG["SLOT3X3_WEIGHT_STEP"])
 )

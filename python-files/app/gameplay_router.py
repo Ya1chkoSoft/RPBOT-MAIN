@@ -1,148 +1,145 @@
-"""
-Маршрутизатор для игровых функций: рейтинг стран, голосование и т.д.
-"""
 import math
 from aiogram import Router, types, F
 from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy.ext.asyncio import AsyncSession
+import logging
 
-from .database.requests import (
-    get_full_user_profile, 
+logger = logging.getLogger(__name__)
+
+# Импортируем только нужные реквесты
+from app.database.requests import (
     get_countries_for_list, 
     join_country, 
     check_review_cooldown, 
     save_review
 )
-from .database.models import MemeCountry
-
+from app.keyboard import countries_top_keyboard, rating_keyboard
 gameplay_router = Router()
 
-# --- 1. СПИСОК СТРАН И ВСТУПЛЕНИЕ (/top) ---
-
-@gameplay_router.message(Command("top"))
-async def cmd_top_countries(message: types.Message, session: AsyncSession):
-    await show_countries_page(message, session, page=1)
-
-async def show_countries_page(message_or_call, session, page):
+async def show_countries_page(
+    event: types.Message | types.CallbackQuery,
+    session: AsyncSession,
+    page: int,
+    sort_by: str = "influence"
+):
     limit = 5
-    countries, total_count = await get_countries_for_list(session, page, limit)
-    
-    if not countries:
-        text = "🌍 Стран пока нет. Создайте свою через /createcountry!"
-        if isinstance(message_or_call, types.CallbackQuery):
-            await message_or_call.answer(text)
-        else:
-            await message_or_call.answer(text)
-        return
+    countries, total_count = await get_countries_for_list(session, page, limit, sort_by)
 
-    # Формируем текст
+    if not countries and page == 1:
+        msg = "🌍 Стран пока нет."
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer(msg, show_alert=True)
+        return await event.answer(msg)
+
     total_pages = math.ceil(total_count / limit)
-    text = f"🏆 **РЕЙТИНГ МЕМНЫХ СТРАН** (Стр. {page}/{total_pages})\n\n"
-    
-    builder = InlineKeyboardBuilder()
-    
-    for i, c in enumerate(countries, start=(page-1)*limit + 1):
-        # Звезды в тексте
-        stars = "⭐" * round(c.avg_rating) if c.avg_rating else "нет оценок"
-        text += f"{i}. **{c.name}**\n"
-        text += f"   📊 Влияние: `{c.influence_points}` | Рейтинг: {c.avg_rating:.1f} ({stars})\n"
-        
-        # Кнопка вступления для каждой страны
-        builder.button(text=f"✈️ Вступить в {c.name}", callback_data=f"join:{c.country_id}")
-    
-    # Кнопки навигации
-    row_nav = []
-    if page > 1:
-        row_nav.append(types.InlineKeyboardButton(text="⬅️", callback_data=f"top_page:{page-1}"))
-    if page < total_pages:
-        row_nav.append(types.InlineKeyboardButton(text="➡️", callback_data=f"top_page:{page+1}"))
-    
-    builder.row(*row_nav)
-    
-    if isinstance(message_or_call, types.CallbackQuery):
-        await message_or_call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await message_or_call.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
 
-# Обработка листания страниц
-@gameplay_router.callback_query(F.data.startswith("top_page:"))
-async def on_top_page(call: types.CallbackQuery, session: AsyncSession):
-    page = int(call.data.split(":")[1])
-    await show_countries_page(call, session, page)
-    await call.answer()
+    sort_names = {"influence": "Влиянию", "rating": "Рейтингу", "newest": "Новизне"}
+    current_sort_name = sort_names.get(sort_by, "Влиянию")
 
-# Обработка вступления
-@gameplay_router.callback_query(F.data.startswith("join:"))
-async def on_join_click(call: types.CallbackQuery, session: AsyncSession):
-    country_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-    
-    # Используем правильный формат join_country
-    success, msg = await join_country(
-        session=session,
-        user_id=user_id,
-        search_method="id",
-        search_value=str(country_id)
-    )
-    
-    if success:
-        await call.message.answer(f"✅ **Успешно!** {msg}", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await call.answer(f"🚫 {msg}", show_alert=True)
+    text = f"🏆 <b>РЕЙТИНГ СТРАН</b> (по {current_sort_name})\n"
+    text += f"📖 Стр. {page}/{total_pages}\n"
+    text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
 
-# --- 2. ОЦЕНКА СТРАНЫ (/rate) ---
+    for i, c in enumerate(countries, start=1):
+        rating = c.avg_rating or 0
+        stars = "⭐" * round(rating) if rating > 0 else "нет оценок"
+        text += f"{i}. <b>{c.name}</b>\n"
+        text += f"   📊 Влияние: <code>{c.influence_points}</code> | {rating:.1f} {stars}\n"
 
-@gameplay_router.message(Command("rate"))
-async def cmd_rate_country(message: types.Message, session: AsyncSession):
-    user_id = message.from_user.id
-    profile = await get_full_user_profile(session, user_id)
-    
-    # 1. Проверяем, в стране ли юзер
-    if not profile or not profile.country:
-        await message.answer("🚫 Вы бомж! Вступите в страну через /top, чтобы оценивать её.")
-        return
-        
-    country = profile.country
-    
-    # 2. Проверяем КД
-    can_vote, wait_time = await check_review_cooldown(session, user_id, country.country_id)
-    if not can_vote:
-        await message.answer(f"⏳ **Рано!** Вы уже голосовали. Следующая попытка через: **{wait_time}**.", parse_mode=ParseMode.MARKDOWN)
-        return
+        # Добавляем ссылку, если она есть
+        if c.country_url:
+            text += f"   🔗 <a href='{c.country_url}'>Ссылка</a>\n"
 
-    # 3. Рисуем кнопки 1-5
-    builder = InlineKeyboardBuilder()
-    for i in range(1, 6):
-        builder.button(text="⭐" * i, callback_data=f"vote:{country.country_id}:{i}")
-    builder.adjust(1) # Кнопки в столбик
-    
-    await message.answer(
-        f"🗳 **Оцените страну: {country.name}**\n"
-        f"Ваш голос влияет на рейтинг! (Можно менять раз в 7 дней)",
-        reply_markup=builder.as_markup(),
-        parse_mode=ParseMode.MARKDOWN
-    )
+        text += "\n"
 
-# Обработка нажатия на звезду
-@gameplay_router.callback_query(F.data.startswith("vote:"))
-async def on_vote_click(call: types.CallbackQuery, session: AsyncSession):
-    # data format: vote:country_id:rating
-    parts = call.data.split(":")
-    country_id = int(parts[1])
-    rating = int(parts[2])
-    user_id = call.from_user.id
-    
-    # Повторная проверка КД (на всякий случай)
-    can_vote, _ = await check_review_cooldown(session, user_id, country_id)
-    if not can_vote:
-        await call.answer("⏳ Кулдаун активен!", show_alert=True)
-        return
+    text += "✈️ <i>Выберите номер для вступления или смените фильтр:</i>"
+
+    markup = countries_top_keyboard(countries, page, total_pages, sort_by)
 
     try:
-        await save_review(session, user_id, country_id, rating)
-        await call.message.edit_text(f"✅ Вы поставили **{rating} ⭐**!\nСпасибо за гражданскую позицию.")
-        await call.answer("Голос принят!")
-    except Exception as e:
-        await call.answer("Ошибка при голосовании :(", show_alert=True)
+        if isinstance(event, types.CallbackQuery):
+            await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            # Показываем сообщение, если стран нет
+            if total_count == 0:
+                await event.answer("⚠️ Стран пока нет.", show_alert=True)
+        else:
+            await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    except TelegramBadRequest:
+        if isinstance(event, types.CallbackQuery):
+            await event.answer()
+
+@gameplay_router.message(Command("top"))
+async def cmd_top(message: types.Message, session: AsyncSession):
+    await show_countries_page(message, session, 1, "influence")
+
+@gameplay_router.callback_query(F.data.startswith("top_page:"))
+async def on_page(call: types.CallbackQuery, session: AsyncSession):
+    # Разбираем новый формат: top_page:PAGE:SORT
+    parts = call.data.split(":")
+    page = int(parts[1])
+    sort_by = parts[2] if len(parts) > 2 else "influence"
+
+    countries, total_count = await get_countries_for_list(session, page, 5, sort_by)
+    total_pages = math.ceil(total_count / 5)
+
+    # Проверяем, что страница существует
+    if page <= 0 or page > total_pages:
+        await call.answer("Эта страница не существует.", show_alert=True)
+        return
+
+    await show_countries_page(call, session, page, sort_by)
+    await call.answer()
+
+@gameplay_router.callback_query(F.data.startswith("join:"))
+async def on_join(call: types.CallbackQuery, session: AsyncSession, user):
+    """
+    Вступление: теперь максимально чисто.
+    user уже подгружен мидлварью.
+    """
+    country_id = int(call.data.split(":")[1])
+
+    # Передаем сессию и готовый объект пользователя
+    success, msg = await join_country(session, user, country_id=country_id)
+
+    if success:
+        await call.message.answer(msg, parse_mode="HTML")
+        await call.answer()
+    else:
+        await call.answer(msg, show_alert=True)
+
+@gameplay_router.message(Command("rate"))
+async def cmd_rate(message: types.Message, session: AsyncSession, user):
+    """
+    Оценка: используем данные из объекта user, подгруженного мидлварью.
+    """
+    if not user.country_id:
+        return await message.answer("🚫 Вы не состоите в стране!")
+
+    # Проверка кулдауна
+    can_vote, wait = await check_review_cooldown(session, user.user_id, user.country_id)
+    if not can_vote:
+        return await message.answer(f"⏳ Рано! Ждите: <code>{wait}</code>", parse_mode="HTML")
+
+    # В модели User связь country должна быть подгружена (lazy="joined" или "selectin")
+    country_name = user.country.name if user.country else "свою страну"
+
+    await message.answer(
+        f"🗳 <b>Оценка страны: {country_name}</b>",
+        reply_markup=rating_keyboard(user.country_id),
+        parse_mode="HTML"
+    )
+
+@gameplay_router.callback_query(F.data.startswith("vote:"))
+async def on_vote(call: types.CallbackQuery, session: AsyncSession, user):
+    """
+    Голосование: user.user_id вместо call.from_user.id для единообразия.
+    """
+    _, c_id, val = call.data.split(":")
+
+    success, msg = await save_review(session, user.user_id, int(c_id), int(val))
+
+    if success:
+        await call.message.edit_text(f"✅ Вы поставили <b>{val} ⭐</b>!")
+    else:
+        await call.answer(msg, show_alert=True)

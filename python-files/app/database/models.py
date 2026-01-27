@@ -4,7 +4,7 @@ from datetime import datetime
 from sqlalchemy.orm import relationship, DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import (
     Integer, String, BigInteger, ForeignKey, Boolean, 
-    DateTime, Float, func, UniqueConstraint, CheckConstraint, text, Index
+    DateTime, Float, func, UniqueConstraint, CheckConstraint, text, Text, Index
 )
 from .session import engine 
 from sqlalchemy import BigInteger, String, DateTime, Boolean, ForeignKey, Integer, Float, UniqueConstraint, CheckConstraint, Index, func
@@ -55,6 +55,7 @@ class User(Base):
 
     position: Mapped[str] = mapped_column(String(50), default="Путешественник", nullable=False)
     is_ruler: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    lost_in_casino: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     last_country_creation: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_country_deletion: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -62,7 +63,6 @@ class User(Base):
 
     country_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("meme_countries.country_id"), nullable=True)
 
-    # КЛЮЧЕВОЙ ФИКС — добавляем foreign_keys
     country_blacklisted: Mapped[List["CountryBlacklist"]] = relationship(
         "CountryBlacklist",
         foreign_keys=[CountryBlacklist.user_id],  # ← вот это спасает
@@ -87,38 +87,75 @@ class User(Base):
 
     reviews: Mapped[List["CountryReview"]] = relationship("CountryReview", back_populates="user")
 
-
 class MemeCountry(Base):
     __tablename__ = "meme_countries"
 
-    country_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    ruler_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.user_id"), nullable=False)
+    # ОСНОВНАЯ ИНФОРМАЦИЯ
+    country_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Уникальный ID страны
+    ruler_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.user_id"), nullable=False)  # Кто правит страной
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    
+    # ИДЕНТИФИКАЦИЯ И НАЗВАНИЯ
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)  # ID Telegram чата страны
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)  # Официальное название страны
+    memename: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)  # Мемное имя/шутка страны
 
-    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
-    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
-    memename: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
-    ideology: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    avatar_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    position: Mapped[str] = mapped_column(String(50), default="Путешественник", nullable=False)
-    map_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    # ОПИСАНИЕ И ДЕТАЛИ
+    description: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)  # Подробное описание страны
+    ideology: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # Идеология/политика страны
+    avatar_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Ссылка на флаг/эмблему
+    position: Mapped[str] = mapped_column(String(50), default="Путешественник", nullable=False)  # Должность в стране (по умолчанию)
+    map_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)  # Ссылка на карту страны
+    country_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # СТАТИСТИКА И РЕЙТИНГ
+    influence_points: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # Очки влияния страны
+    avg_rating: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)  # Средний рейтинг страны
+    total_reviews: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # Количество отзывов
 
-    influence_points: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    avg_rating: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    total_reviews: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # ЭКОНОМИКА И НАЛОГИ
+    tax_rate: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)  # Налоговая ставка (0.0-0.5)
+    treasury: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)  # Казна страны (деньги)
 
-    tax_rate: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    treasury: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # ЧЕРНЫЙ СПИСОК
+    blacklist: Mapped[List["CountryBlacklist"]] = relationship("CountryBlacklist", back_populates="country", lazy="selectin")  # Кто запрещен в стране
 
-    blacklist: Mapped[List["CountryBlacklist"]] = relationship("CountryBlacklist", back_populates="country", lazy="selectin")
+    # ФАЙЛЫ (ЛОКАЛЬНОЕ ХРАНЕНИЕ)
+    flag_file_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # file_id флага в Telegram
+    map_file_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # file_id карты в Telegram
 
-    ruler: Mapped["User"] = relationship("User", back_populates="ruled_country_list", foreign_keys=[ruler_id])
-    citizens: Mapped[List["User"]] = relationship("User", back_populates="country", foreign_keys="User.country_id")
-    reviews: Mapped[List["CountryReview"]] = relationship("CountryReview", back_populates="country")
+    # СВЯЗИ С ПОЛЬЗОВАТЕЛЯМИ
+    ruler: Mapped["User"] = relationship("User", back_populates="ruled_country_list", foreign_keys=[ruler_id])  # Сам правитель
+    citizens: Mapped[List["User"]] = relationship("User", back_populates="country", foreign_keys="User.country_id")  # Граждане страны
+    reviews: Mapped[List["CountryReview"]] = relationship("CountryReview", back_populates="country")  # Отзывы о стране
+
 
 # ==================================================
 # 3. Остальные модели
 # ==================================================
+class RPEvent(Base):
+    __tablename__ = 'rp_events'
+    
+    event_id: Mapped[int] = mapped_column(primary_key=True)
+    admin_id: Mapped[int] = mapped_column(ForeignKey('users.user_id'))
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    title: Mapped[str] = mapped_column(String(100))
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default='active')  # active, finished, cancelled
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+    finished_at: Mapped[Optional[datetime]]
+    
+    participants = relationship("RPParticipant", back_populates="event")
+
+class RPParticipant(Base):
+    __tablename__ = 'rp_participants'
+    
+    participant_id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey('rp_events.event_id'))
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.user_id'))
+    joined_at: Mapped[datetime] = mapped_column(default=func.now())
+    
+    event = relationship("RPEvent", back_populates="participants")
+    user = relationship("User")
 
 class CountryReview(Base):
     __tablename__ = "country_reviews"

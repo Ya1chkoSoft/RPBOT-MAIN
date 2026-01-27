@@ -21,79 +21,44 @@ async def get_or_create_user(
     userfullname: str = ""
 ) -> User:
     """
-    Получает пользователя. Если нет — создает.
+    Получает пользователя со всеми связями. Если нет — создает.
     """
-    stmt = select(User).where(User.user_id == user_id)
+    # Используем selectinload, чтобы связи были доступны сразу в памяти
+    stmt = (
+        select(User)
+        .where(User.user_id == user_id)
+        .options(
+            selectinload(User.ruled_country_list), # Чтобы проверка if user.ruled_country_list не падала
+            selectinload(User.country),            # Чтобы сразу видеть название страны
+            selectinload(User.punishments)         # Чтобы проверка на бан работала мгновенно
+        )
+    )
+    
     result = await session.execute(stmt)
     user = result.scalar_one_or_none()
 
     if user:
-        # Обновление данных
+        # Обновление данных (если изменились в телеге)
         if user.username != username:
             user.username = username
         if user.userfullname != userfullname:
             user.userfullname = userfullname
-        # flush происходит автоматически при commit, но можно и явно
     else:
-        # Создание нового
+        # Создание нового профиля
         user = User(
             user_id=user_id, 
             username=username, 
             userfullname=userfullname,
-            position="Путешественник", # Явно задаем должность
+            position="Путешественник",
             points=0,
             adminlevel=0
         )
         session.add(user)
-        # await session.flush() # Не обязательно, commit сделает это
+    
+    # flush поднимет ID и зафиксирует изменения в текущей транзакции
+    await session.flush()
     
     return user
-
-async def db_ensure_full_user_profile(
-    session: AsyncSession, 
-    user_id: int, 
-    username: str, 
-    userfullname: str
-) -> tuple[Optional[User], bool]:
-    """
-    Гарантированно возвращает профиль пользователя.
-    Если юзера нет -> создает, коммитит, сбрасывает кэш и возвращает профиль.
-    """
-    
-    # 1. Сначала пробуем получить (может вернуть None)
-    profile = await get_full_user_profile(session, user_id)
-    was_created = False
-    
-    if profile is None:
-        try:
-            # 2. Создаем (или обновляем базовую запись)
-            await get_or_create_user(
-                session=session,
-                user_id=user_id,
-                username=username,
-                userfullname=userfullname
-            )
-            
-            # 3. ФИКСИРУЕМ создание
-            await session.commit() 
-            
-            # 4. ВАЖНО: Сбрасываем кэш сессии, чтобы следующий SELECT увидел изменения
-            session.expire_all() 
-            
-            # 5. Загружаем полный профиль заново (теперь он точно есть)
-            profile = await get_full_user_profile(session, user_id)
-            
-            if profile:
-                was_created = True
-            else:
-                logging.error(f"FATAL: User {user_id} created but not found by select!")
-            
-        except Exception as e:
-            await session.rollback()
-            logging.error("Критическая ошибка при регистрации пользователя %s: %s", user_id, e)
-            return None, False
-
-    return profile, was_created
 
 async def get_full_user_profile(session: AsyncSession, user_id: int) -> User | None:
     """
@@ -135,3 +100,24 @@ async def reset_user_cooldown(session: AsyncSession, user_id: int):
         user.last_country_creation = None
         return True
     return False
+
+# ==========================================
+# 🎰 ТОП ЛУДОМАНОВ (Проёбанные баблишки в казике)
+# ==========================================
+async def get_top_ludomans(session: AsyncSession) -> list[User]:
+    """
+    Получает топ 10 пользователей, которые больше всего проебали в казино
+    """
+    try:
+        stmt = (
+            select(User)
+            .where(User.lost_in_casino > 0)  # Только те, кто что-то проебал
+            .order_by(User.lost_in_casino.desc())
+            .limit(10)
+        )
+        result = await session.execute(stmt)
+        top_users = result.scalars().all()
+        return list(top_users)
+    except Exception as e:
+        logger.error(f"Error in get_top_ludomans: {e}")
+        return []

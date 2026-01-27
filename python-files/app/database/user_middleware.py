@@ -4,19 +4,16 @@ from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Импортируем ваши функции и модели
-# (точка означает, что мы ищем в той же папке app/database)
-from .requests import db_ensure_full_user_profile
-from .models import User
+# Импортируем только то, что нужно. 
+# Мы импортируем функцию получения юзера, которая НЕ вызывает циклов.
+from app.database.requests.users import get_or_create_user
 
 logger = logging.getLogger(__name__)
 
 class UserMiddleware(BaseMiddleware):
     """
-    Middleware, который выполняется ПОСЛЕ SessionMiddleware.
-    1. Берет session из data.
-    2. Находит/Создает юзера в БД.
-    3. Кладет объект User в data['current_user'].
+    Чистый Middleware для работы с пользователем.
+    Работает в едином цикле транзакции, без принудительных коммитов.
     """
     async def __call__(
         self,
@@ -25,33 +22,33 @@ class UserMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         
-        # 1. Проверяем наличие сессии (она должна быть создана SessionMiddleware)
+        # 1. Сессия должна быть проброшена из SessionMiddleware выше
         session: AsyncSession = data.get("session")
         if not session:
-            logger.error("UserMiddleware: Session not found! Check SessionMiddleware registration.")
+            logger.error("UserMiddleware: Сессия не найдена в data!")
             return await handler(event, data)
 
-        # 2. Получаем данные о пользователе Telegram
+        # 2. Игнорируем апдейты без юзера (например, посты в каналах)
         tg_user = event.from_user
-        if not tg_user:
-            # Если это служебное обновление без пользователя
+        if not tg_user or tg_user.is_bot:
             return await handler(event, data)
 
-        # 3. Загружаем или создаем профиль
-        # db_ensure_full_user_profile делает commit и expire_all, возвращая свежий профиль
-        user, was_created = await db_ensure_full_user_profile(
-            session=session,
-            user_id=tg_user.id,
-            username=tg_user.username,
-            userfullname=tg_user.full_name
-        )
+        try:
+            user = await get_or_create_user(
+                session=session,
+                user_id=tg_user.id,
+                username=tg_user.username or "",
+                userfullname=tg_user.full_name or ""
+            )
 
-        if user is None:
-            logger.critical(f"UserMiddleware: Failed to get/create user {tg_user.id}")
-            # Можно прервать выполнение, чтобы не вызывать хендлер с ошибкой
-            return 
+            # 4. Кладем объект в data под коротким именем 'user'
+            # Теперь в любом хендлере можно просто добавить аргумент 'user: User'
+            data["user"] = user
 
-        data["current_user"] = user
+        except Exception as e:
+            logger.error(f"Ошибка в UserMiddleware для юзера {tg_user.id}: {e}")
+            # В случае ошибки БД лучше не ломать бота, а пропустить запрос дальше,
+            # хендлеры сами разберутся, если 'user' будет None.
+            data["user"] = None
 
-        # 5. Передаем управление хендлеру
         return await handler(event, data)

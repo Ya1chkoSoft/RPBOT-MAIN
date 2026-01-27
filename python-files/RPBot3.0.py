@@ -15,6 +15,7 @@ from app.countrycreate import country_create_router
 from app.database.session import async_session as DB_POOL
 from app.admin_router import admin_router
 from app.gameplay_router import gameplay_router
+from app.rp_events_router import router as rp_events_router
 
 # --- МИДЛВАРЕ ---
 from app.database.middleware import SessionMiddleware 
@@ -73,6 +74,7 @@ async def main() -> None:
     dp.include_router(admin_router)
     dp.include_router(country_create_router)
     dp.include_router(gameplay_router)
+    dp.include_router(rp_events_router)
     dp.include_router(router)
 
     async def on_startup() -> None:

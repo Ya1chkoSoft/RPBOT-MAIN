@@ -7,10 +7,10 @@
 # Пользователи (users)
 from .users import (
     get_or_create_user,
-    db_ensure_full_user_profile,
     get_full_user_profile,
     get_user_by_username,
-    reset_user_cooldown
+    reset_user_cooldown,
+    get_top_ludomans
 )
 
 # Стран функции (countries)
@@ -37,7 +37,9 @@ from .countries import (
     edit_country_map_url,
     edit_country_flag,
     edit_country_memename,
+    edit_country_url,
     get_country_by_ruler_id
+    
 )
 
 # Админы и наказания (admins)

@@ -19,7 +19,7 @@ from aiogram.filters.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 
 # Импортируем только функции-обёртки для работы с БД
-from app.database.requests import get_or_create_user, get_top_users, add_admin, get_user_by_username, get_full_user_profile
+from app.database.requests import get_or_create_user, get_top_users, add_admin, get_user_by_username, get_full_user_profile, get_top_ludomans
 from sqlalchemy.future import select
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,6 +53,8 @@ from config import (
     SLOT_SYMBOLS, 
     SYMBOL_WEIGHTS, 
     SYMBOL_MULTIPLIERS,
+    SLOT3X3_SYMBOLS,
+    SLOT3X3_WEIGHTS,
     SLOT3X3_MULTIPLIERS,
 )
 # -----------------------------------------------------------------
@@ -81,11 +83,9 @@ async def cmd_start(message: Message, session: AsyncSession):
     
     # Безопасно готовим имя пользователя
     user_name = escape_html(message.from_user.full_name)
-    
-    # Исправленный текст (убран лишний </b> в конце)
     welcome_text = (
         f"<b>ПРИВЕТСТВУЮ, {user_name}, В НАШЕМ РП БОТЕ</b>\n"
-        "<i>версия бота 3.5</i>\n\n"
+        "<i>версия бота 3.5.2</i>\n\n"
         "<b>ВНИМАНИЕ ЭТО БЕТА ТЕСТ, БОТ МОЖЕТ БЫТЬ НЕСТАБИЛЬНЫМ!</b>\n"
         "данный бот будет помогать вам в рп и тд :3\n"
         "ниже будет располагаться меню, желаем вам удачи\n"
@@ -112,9 +112,13 @@ pattern = re.compile(
 )
 
 
-#передача очков  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# передача очков
 @router.message(F.text.lower().startswith("рп передать"))
-async def transfer_points(message: Message, session: AsyncSession):
+async def transfer_points(
+    message: Message, 
+    session: AsyncSession,
+    user: User  # ✅ User из middleware
+):
     args = message.text.strip().split()
     if len(args) < 3:
         await message.reply("❗ Формат: рп передать <сумма> <@юзер или ID>")
@@ -130,7 +134,6 @@ async def transfer_points(message: Message, session: AsyncSession):
         await message.reply("❗ Сумма должна быть больше нуля.")
         return
 
-    sender_id = message.from_user.id
     receiver_id = None
 
     # Получатель из реплая
@@ -142,60 +145,42 @@ async def transfer_points(message: Message, session: AsyncSession):
         # Если @username
         if receiver_arg.startswith("@"):
             username = receiver_arg[1:]
-            async with async_session() as session:
-                user_result = await session.execute(
-                    select(User).where(User.username == username)
-                )
-                receiver = user_result.scalar_one_or_none()
-                if receiver:
-                    receiver_id = receiver.user_id
-        else:
-            # Пытаемся интерпретировать как ID
-            if receiver_arg.isdigit():
-                receiver_id = int(receiver_arg)
+            receiver = await session.scalar(
+                select(User).where(func.lower(User.username) == username.lower())
+            )
+            if receiver:
+                receiver_id = receiver.user_id
+        elif receiver_arg.isdigit():
+            receiver_id = int(receiver_arg)
 
     if not receiver_id:
         await message.reply("❌ Укажите получателя (реплай или @username или ID).")
         return
 
-    async with async_session() as session:
-        # ищем отправителя
-        sender_result = await session.execute(select(User).where(User.user_id == sender_id))
-        sender = sender_result.scalar_one_or_none()
+    # Получатель
+    receiver = await session.get(User, receiver_id)
+    if not receiver:
+        await message.reply("❌ Получатель не найден.")
+        return
 
-        if not sender:
-            await message.reply("❌ Вы не зарегистрированы.")
-            return
+    if receiver.user_id == user.user_id:
+        await message.reply("❌ Нельзя переводить очки самому себе.")
+        return
 
-        if sender.points < amount:
-            await message.reply("🚫 Недостаточно очков для перевода.")
-            return
+    if user.points < amount:
+        await message.reply("🚫 Недостаточно очков.")
+        return
 
-        # ищем получателя
-        receiver_result = await session.execute(select(User).where(User.user_id == receiver_id))
-        receiver = receiver_result.scalar_one_or_none()
+    # перевод
+    user.points -= amount
+    receiver.points += amount
 
-        if not receiver:
-            await message.reply("❌ Получатель не найден или не зарегистрирован.")
-            return
-
-        if receiver.user_id == sender.user_id:
-            await message.reply("❌ Нельзя переводить очки самому себе.")
-            return
-
-        # перевод
-        sender.points -= amount
-        receiver.points += amount
-
-        session.add_all([sender, receiver])
-
-        await message.reply(
-            f"💸 {amount} очков успешно переведено!\n"
-            f"👤 Отправитель: {sender.username or sender.user_id}\n"
-            f"👤 Получатель: {receiver.username or receiver.user_id}\n"
-            f"💰 Ваш баланс: {sender.points}"
-        )
-
+    await message.reply(
+        f"💸 {amount} очков успешно переведено!\n"
+        f"👤 Отправитель: {user.username or user.user_id}\n"
+        f"👤 Получатель: {receiver.username or receiver.user_id}\n"
+        f"💰 Ваш баланс: {user.points}"
+    )
 # --- КАЗИНО (1x3) ---
 
 #Путь к GIF должен быть константой модуля.
@@ -287,11 +272,12 @@ async def casino(message: Message, session: AsyncSession):
             f"🏆 Вы выиграли <b>{safe_winnings}</b> очков!"
         )
     else:
+    # Добавляем проигранные деньги к счету "Проёбанных баблишек"
+        user.lost_in_casino += bet
         result_text = (
             f"{win_message}\n"
-            f"💰 Ваша ставка: <b>{safe_bet}</b> очков"
+            f"💸 Проёбано в казино: <b>{user.lost_in_casino}</b> очков"
         )
-        
     caption_text = (
         f"🎰 | {slot1} | {slot2} | {slot3} |\n\n{result_text}\n\n"
         f"💰 Ваш баланс: <b>{safe_points}</b> очков.\n"
@@ -412,7 +398,6 @@ async def slot_machine(message: Message, session: AsyncSession):
     
     if winning_lines:
         for symbol, line_name, line_mult in winning_lines:
-            # 🔥 БЕРЕМ МНОЖИТЕЛЬ ИЗ ТВОЕГО КОНФИГА
             # Если символа нет в конфиге (баг), вернем 0
             symbol_val = SLOT3X3_MULTIPLIERS.get(symbol, 0)
             
@@ -431,7 +416,8 @@ async def slot_machine(message: Message, session: AsyncSession):
             f"💵 <b>Общий выигрыш:</b> <b>{total_winnings}</b> очков!"
         )
     else:
-        result_text = f"❌ Увы, вы проиграли <b>{bet}</b> очков.\n💸 Всё ушло админу 😉"
+        user.lost_in_casino += bet
+        result_text = f"❌ Увы, вы проиграли <b>{bet}</b> очков.\n💸 Проёбано в казино: <b>{user.lost_in_casino}</b>"
 
     # --- 6. Запись истории ---
     history = History(
@@ -479,9 +465,34 @@ async def slot_machine(message: Message, session: AsyncSession):
 async def test_ping(message: Message, session: AsyncSession):
     await message.reply("pong")
 
+async def top_ludomans(message: Message, session: AsyncSession):
+    """
+    Показывает топ 10 пользователей, которые больше всех проебали в казино
+    """
+    try:
+        top_users = await get_top_ludomans(session)
+        
+        if not top_users:
+            await message.reply("😔 Пока никто не проебал в казино. Начни первым! 🎰")
+            return
+        
+        # Форматируем сообщение
+        text = "🏆 <b>Топ 10 Лудоманов</b>\n"
+        text += "━━━━━━━━━━━━━━━━━━\n"
+        
+        for i, user in enumerate(top_users, 1):
+            username = user.username if user.username else user.userfullname
+            text += f"{i}. <b>{username}</b> — <b>{user.lost_in_casino}</b> проёбанных очков\n"
+        
+        await message.reply(text, parse_mode='HTML')
+        
+    except Exception as e:
+        logger.error(f"Error in top_ludomans handler: {e}")
+        await message.reply("❌ Ошибка при получении топа лудоманов.")
+
 # ОСНОВНЫЕ ХЕНДЛЕРЫ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 @router.message(F.text)
-async def randomizer1(message: Message, session: AsyncSession):
+async def randomizer1(message: Message, session: AsyncSession, user: User):  # ✅ Добавлен user
     global rand, rand1_100
     text = message.text.strip().lower()
     rand = random.randint(1, 10)
@@ -489,6 +500,9 @@ async def randomizer1(message: Message, session: AsyncSession):
     
     # 1. Сначала обрабатываем простые, не связанные с БД, кейсы
     match text:
+        case 'рп топ луды':
+            await top_ludomans(message, session)
+            return
         case 'фарма':
             await message.reply('Иди на поле, раб')
         case '1' | 'ранд' | 'рандом' | 'rand' | 'random':
@@ -503,78 +517,60 @@ async def randomizer1(message: Message, session: AsyncSession):
             await message.reply('<b>ЛС</b>', parse_mode='HTML')
         case 'ахуеть':
             await message.reply('<b>Звуки бравл старса</b>', parse_mode='HTML')
+# 2. ИНВАРИАНТЫ ДЛЯ ДЖАРВИСА (Через Guard Clauses)
+        case t if "джарвис" in t and "хуйня" in t:
+            await message.reply('<b>Сэр, я сам вахуе</b>', parse_mode='HTML')
+        case t if t.startswith(("джарвис", "jarvis")):
+            await message.reply('<b>Сэр, я вас внимательно слушаю.</b>', parse_mode='HTML')
     
     # 2. Обрабатываем кейсы, связанные с БД (требующие транзакции)
     
-    # 2.1. Создание/обновление пользователя для всех команд
-    if text in ('рп профиль', 'рп топ'):
-        
-        # Гарантируем, что пользователь существует в БД перед запросом его данных
-        await get_or_create_user(
-            session=session,
-            user_id=message.from_user.id,
-            username=message.from_user.username or "",
-            userfullname=message.from_user.full_name
-        )
-        
-        # 2.2. Обработка 'рп профиль'
-        if text == 'рп профиль':
-            
-            # Получаем полный профиль с присоединенными данными страны
-            profile_user = await get_full_user_profile(session, message.from_user.id)
-            
-            if not profile_user:
-                await message.reply("⛔ Произошла ошибка при загрузке вашего профиля.")
-                return
+    if text == 'рп профиль':
+        # user уже подгружен миддлварью
+        if not user:
+            await message.reply("⛔ Произошла ошибка при загрузке вашего профиля.")
+            return
 
-            # Определение статуса и страны
-            country_info = profile_user.country.name if profile_user.country else "Не состоит"
-            #Определяем статус пользователя в стране
+        # Определение страны
+        country_info = user.country.name if user.country else "Не состоит"
+        
+        # Определяем статус в стране
+        if user.country and user.country.ruler_id == user.user_id:
+            ruler_status = "Правитель"
+        elif user.position:
+            ruler_status = user.position
+        else:
             ruler_status = "Гражданин"
-            
-            if profile_user.country:
-                # 1. Проверяем, является ли пользователь правителем
-                if profile_user.country.ruler_id == profile_user.user_id:
-                    ruler_status = "Правитель"
-                # 2. Если не правитель, берем его должность в стране (position)
-                elif profile_user.position:
-                    ruler_status = profile_user.position
-            
-            # 3) Отвечаем пользователю с его НОВЫМИ данными
-            await message.reply(
-                "👑 **Ваш РП Профиль**\n"
-                "---------------------------------\n"
-                f"• Имя: **{profile_user.userfullname}**\n"
-                f"• ID: `{profile_user.user_id}`\n"
-                f"• РП очки: **{profile_user.points}**\n"
-                f"• Страна: **{country_info}**\n"
-                f"• Статус в стране: **{ruler_status}**",
-                parse_mode='Markdown'
-            )
+
+        await message.reply(
+            "👑 **Ваш РП Профиль**\n"
+            "---------------------------------\n"
+            f"• Имя: **{user.userfullname}**\n"
+            f"• ID: `{user.user_id}`\n"
+            f"• РП очки: **{user.points}**\n"
+            f"• Страна: **{country_info}**\n"
+            f"• Статус в стране: **{ruler_status}**\n"
+            f"💸 Проёбано в казино: **{user.lost_in_casino}**",
+            parse_mode='Markdown'
+        )
+        return
+
+    elif text == 'рп топ':
+        top_users = await get_top_users(session=session, limit=10)
+        
+        if not top_users:
+            await message.answer("Топ рпшеров пуст.")
             return
 
-        # 2.3. Обработка 'рп топ'
-        elif text == 'рп топ':
-            top_users = await get_top_users(session=session, limit=10)
-            
-            if not top_users:
-                await message.answer("Топ рпшеров пуст.")
-                return
+        response_lines = ["🏆 **Топ РП игроков:**\n---"]
+        for i, u in enumerate(top_users, start=1):
+            display_name = u.userfullname or (u.username or f"ID {u.user_id}")
+            country_name = f" ({u.country.name})" if u.country else ""
+            response_lines.append(f"**{i}.** {display_name}{country_name} — **{u.points}** баллов")
 
-            response_lines = ["🏆 **Топ РП игроков:**\n---"]
-            for i, user in enumerate(top_users, start=1):
-                # Для отображения берем полное имя или никнейм
-                display_name = user.userfullname or (user.username or f"ID {user.user_id}")
-                
-                # Добавляем название страны
-                country_name = f" ({user.country.name})" if user.country else ""
-                
-                response_lines.append(f"**{i}.** {display_name}{country_name} — **{user.points}** баллов")
-
-            response_text = "\n".join(response_lines)
-            await message.answer(response_text, parse_mode='Markdown')
-            return
-            
+        response_text = "\n".join(response_lines)
+        await message.answer(response_text, parse_mode='Markdown')
+        return
     # 3. Обработка ключевых слов через pattern (если не сработал match)
     if match := pattern.search(text):
         key = match.group(1).lower()
@@ -623,7 +619,7 @@ async def defrpcommandsbutton(callback: CallbackQuery):
 кубик - кидает кубик
 женщина,мужчина - угар комманды
 РП профиль - ваш профиль в меном мире:
-рп топ - то РП игроков
+рп топ - топ РП игроков
 рп админы - список администраторов
 ''',
         parse_mode='HTML',
@@ -642,7 +638,7 @@ async def defcountrycommandsbutton(callback: CallbackQuery):
         "• <code>/join [ID/Название]</code> — вступить в страну\n"
         "• <code>/leave</code> — покинуть текущую страну\n"
         "• <code>/mycountry</code> — профиль вашей страны\n"
-        "• <code>/rate [1-5]</code> — оценить страну\n"
+        "• <code>/rate</code> — оценить страну\n"
         "• <code>/donate [сумма]</code> — пожертвовать очки в казну\n\n"
         
         "<b>3. Команды правителя (Администрирование):</b>\n"
@@ -654,14 +650,10 @@ async def defcountrycommandsbutton(callback: CallbackQuery):
         "• <code>/deletecountry</code> — <b>удалить страну навсегда</b>\n\n"
         
         "<b>4. Редактирование страны:</b>\n"
-        "• <code>/editcountry</code> — интерактивное редактирование\n"
-        "• <code>/setname [название]</code> — изменить название\n"
-        "• <code>/setideology [идеология]</code> — изменить идеологию\n"
-        "• <code>/setdescription [описание]</code> — изменить описание\n"
-        "• <code>/setmap [ссылка]</code> — изменить карту\n"
-        "• <code>/setflag</code> — изменить флаг (ответом на фото)\n\n"
-        
+        "• <code>/recreate</code> — интерактивное редактирование\n"
+
         "<b>5. Общая информация:</b>\n"
+        "• <code></code>\n"
         "• <code>/globalstats</code> — топ стран по влиянию\n"
         "• <code>/countrylist [стр]</code> — список всех стран мира"
     )

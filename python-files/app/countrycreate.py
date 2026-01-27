@@ -14,18 +14,15 @@ from sqlalchemy import func
 
 from config import REVIEW_COOLDOWN_DAYS
 from .database.models import User, MemeCountry, CountryReview
-
-from .review_service import ReviewService
 import app.keyboard as kb
 import logging
 
 # Устанавливаем КД в секундах (например, 7 дней)
 COUNTRY_CREATE_COOLDOWN = 7 * 24 * 60 * 60 # 604800 секунд
-
-from .database.requests import (
+from app.keyboard import country_edit_menu, country_edit_confirm, cancel_inline_keyboard, back_to_menu_inline_keyboard
+from app.database.requests import (
     get_or_create_user, 
     get_full_user_profile, 
-    db_ensure_full_user_profile,
     create_meme_country, 
     assign_ruler, 
     get_country_by_name, 
@@ -49,6 +46,7 @@ from .database.requests import (
     edit_country_map_url,
     edit_country_flag,
     edit_country_memename,
+    edit_country_url,
     get_country_by_ruler_id
 )
 logger = logging.getLogger(__name__)
@@ -90,70 +88,69 @@ class CountryCreateStates(StatesGroup):
     waiting_for_flag = State()
 
 class CountryEditStates(StatesGroup):
-    """Шаги для изменения страны"""
     choose_field = State()
-    edit_memename = State()
+    edit_name = State()
     edit_ideology = State()
-    edit_map_url = State()
     edit_description = State()
+    edit_map = State()
+    edit_flag = State()
+    edit_country_url = State() 
 
 
 # ==========================================
 # A. ХЕНДЛЕР: НАЧАЛО /createcountry
 # ==========================================
 @country_create_router.message(Command("createcountry"))
-async def cmd_create_country(message: types.Message, state: FSMContext, session: AsyncSession, bot: Bot):
-    user_id = message.from_user.id
+async def cmd_create_country(
+    message: types.Message, 
+    state: FSMContext, 
+    session: AsyncSession, 
+    bot: Bot,
+    user: User
+):
     chat_id = message.chat.id
     
-    # 1. Сразу проверяем статус в чате (API Telegram)
-    # Владелец — "creator". Админы — "administrator".
-    chat_member = await bot.get_chat_member(chat_id, user_id)
+    # 1. Проверка владельца чата через Telegram API
+    chat_member = await bot.get_chat_member(chat_id, user.user_id)
     is_owner = chat_member.status == "creator"
 
-    # 2. Получаем данные из БД (через твой requests.py)
-    profile, is_banned = await get_creation_status(session, user_id)
-    
-    if profile is None:
-        profile, _ = await db_ensure_full_user_profile(
-            session, user_id, 
-            message.from_user.username or "Unknown", 
-            message.from_user.full_name or "Unknown"
-        )
+    # 2. Проверка бана (по твоей модели punishments)
+    # Предполагаем, что мидлварь подгрузила punishments (lazy="selectin")
+    is_banned = any(p.is_active and p.action_type == "ban" for p in user.punishments)
 
-    # 3. Расширенный match-case (добавили 5-й параметр: is_owner)
-    # Структура: (Тип чата, Есть страна, Кулдаун, Бан, Владелец чата)
-    match (message.chat.type, profile.country_id is not None, profile.last_country_creation, is_banned, is_owner):
+    # 3. Match-case: Четкая логика без костылей
+    # (Тип чата, Состоит в стране, Последнее создание, Забанен, Владелец)
+    match (message.chat.type, user.country_id is not None, user.last_country_creation, is_banned, is_owner):
         
-        # Проверка на тип чата
+        # Только для групп
         case (chat_type, _, _, _, _) if chat_type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
             await message.answer("🚫 Команда работает только в групповых чатах.")
             return
 
-        # Проверка на владение чатом (Новое!)
+        # Только для владельца
         case (_, _, _, _, False):
             await message.answer("🚫 Основать страну может только <b>Владелец чата</b>.", parse_mode="HTML")
             return
             
-        # Уже состоит в стране
+        # Если уже есть страна
         case (_, True, _, _, _):
-            # Убедись, что в get_creation_status есть selectinload(User.country)
-            safe_name = html.escape(profile.country.name if profile.country else "Неизвестно")
-            await message.answer(f"🚫 Ты уже в стране <b>{safe_name}</b>. Выйди через /leave.", parse_mode="HTML")
+            # Т.к. lazy="selectin" в модели, user.country уже доступен без await
+            c_name = html.escape(user.country.name if user.country else "неизвестной стране")
+            await message.answer(f"🚫 Ты уже в стране <b>{c_name}</b>. Выйди через /leave.", parse_mode="HTML")
             return
             
-        # Активный бан
+        # Если бан
         case (_, _, _, True, _):
             await message.reply("❌ У тебя активный бан на создание стран.")
             return
             
-        # Кулдаун (проверка времени)
-        case (_, _, last_creation, _, _) if last_creation and (datetime.now() - last_creation).total_seconds() < COUNTRY_CREATE_COOLDOWN:
-            remaining = int(COUNTRY_CREATE_COOLDOWN - (datetime.now() - last_creation).total_seconds())
-            await message.answer(f"⏳ Кулдаун! Жди <b>{str(timedelta(seconds=remaining))}</b>", parse_mode="HTML")
+        # Кулдаун
+        case (_, _, last, _, _) if last and (datetime.utcnow() - last).total_seconds() < COUNTRY_CREATE_COOLDOWN:
+            rem = int(COUNTRY_CREATE_COOLDOWN - (datetime.utcnow() - last).total_seconds())
+            await message.answer(f"⏳ Кулдаун! Жди <b>{str(timedelta(seconds=rem))}</b>", parse_mode="HTML")
             return
             
-        # Успешный запуск FSM
+        # Если всё ок — запускаем FSM
         case _:
             chat_info = await bot.get_chat(chat_id)
             await state.update_data(
@@ -180,7 +177,7 @@ async def process_memename(message: types.Message, state: FSMContext, session: A
     
     await state.update_data(memename=memename)
     
-    # 🔥 ПЕРЕХОД К СЛЕДУЮЩЕМУ СОСТОЯНИЮ (ideology)
+    # ПЕРЕХОД К СЛЕДУЮЩЕМУ СОСТОЯНИЮ (ideology)
     await state.set_state(CountryCreateStates.ideology)
     
     await message.answer(
@@ -298,412 +295,272 @@ async def process_map_url_and_finish(message: types.Message, state: FSMContext, 
 async def process_map_url_invalid(message: types.Message):
     await message.answer("⚠️ Введите <b>текст</b> ссылки или прочерк '-'.", parse_mode=ParseMode.HTML)
 
-
-@country_create_router.message(Command("editcountry"))
-async def cmd_edit_country(message: types.Message, state: FSMContext, session: AsyncSession):
-    success, country, user = await check_ruler_permissions(message, session)
-    if not success:
-        return
-    
-    await state.set_state(CountryEditStates.choose_field)
-    await message.answer(
-        f"🔧 <b>Редактирование страны: {country.name}</b>\n\n"
-        "Выберите что хотите изменить:",
-        parse_mode="HTML",
-        reply_markup=kb.country_edit_keyboard()
-    )
-    await state.set_state(CountryEditStates.choose_field)
-
-
-# ==========================================
-# E. УСТАНОВКА ФЛАГА (/setflag)
-# ==========================================
-
-@country_create_router.message(Command("setflag"))
-async def cmd_set_flag(message: types.Message, state: FSMContext, **kwargs):
-    """Начало процесса установки флага"""
-    await state.set_state(CountryCreateStates.waiting_for_flag)
-    await message.answer(
-        "🖼 <b>Отправьте изображение</b>, которое станет флагом вашей страны.\n\n"
-        "<i>Совет: лучше использовать квадратные изображения.</i>",
-        parse_mode="HTML"
-    )
-
-@country_create_router.message(CountryCreateStates.waiting_for_flag, F.photo)
-async def process_flag_image(
-    message: types.Message, 
-    state: FSMContext, 
-    session: AsyncSession
-):
-    """Принимаем фото и сохраняем его file_id в базу"""
+#========================================================================================================================
+#ИЗМЕНЕНИЕ ПАРАМЕТРОВ СТРАНЫ
+#========================================================================================================================
+@country_create_router.message(Command("recreate"))
+async def cmd_recreate_country(message: types.Message, state: FSMContext, session: AsyncSession):
     user_id = message.from_user.id
-    
-    # Проверяем, что пользователь является правителем через requests.py
     country = await get_country_by_ruler_id(session, user_id)
     
     if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
+        await message.answer("🚫 Вы не правитель страны!")
         return
     
-    # Берем последний (самый большой) file_id из списка PhotoSize
-    new_flag_id = message.photo[-1].file_id
-    
-    success, msg = await edit_country_flag(session, user_id, new_flag_id)
-    await message.answer(msg)
-    await state.clear()
-
-@country_create_router.message(CountryCreateStates.waiting_for_flag)
-async def process_flag_invalid(message: types.Message):
-    """Если юзер прислал не фото"""
-    await message.answer("⚠️ Пожалуйста, отправьте именно <b>фотографию</b>.")
-
-
-# ==========================================
-# F. РЕДАКТИРОВАНИЕ СТРАНЫ (/editcountry)
-# ==========================================
-
-# Клавиатура для выбора поля редактирования
-def country_edit_keyboard():
-    """Создаем клавиатуру для выбора поля редактирования"""
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                types.InlineKeyboardButton(text="📝 Название", callback_data="edit:name"),
-                types.InlineKeyboardButton(text="🎭 Идеология", callback_data="edit:ideology")
-            ],
-            [
-                types.InlineKeyboardButton(text="🗺 Карта", callback_data="edit:map"),
-                types.InlineKeyboardButton(text="📜 Описание", callback_data="edit:description")
-            ],
-            [
-                types.InlineKeyboardButton(text="🖼 Флаг", callback_data="edit:flag"),
-                types.InlineKeyboardButton(text="❌ Отмена", callback_data="edit:cancel")
-            ]
-        ]
+    sent_message = await message.answer(
+        f"🔧 <b>Редактирование: {country.name}</b>\n\nВыберите поле:",
+        parse_mode="HTML",
+        reply_markup=country_edit_menu()
     )
+    
+    await state.set_state(CountryEditStates.choose_field)
+    await state.update_data(country_id=country.country_id, menu_msg_id=sent_message.message_id)
 
-# Обработчик выбора поля
-@country_create_router.callback_query(CountryEditStates.choose_field)
-async def process_edit_choice(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
+@country_create_router.callback_query(F.data.startswith("edit_"))
+async def handle_edit_callback(callback: types.CallbackQuery, state: FSMContext, session: AsyncSession):
     user_id = callback.from_user.id
+    action = callback.data
+    data = await state.get_data()
+    country_id = data.get('country_id')
     
-    # Проверяем, что пользователь является правителем через requests.py
-    country = await get_country_by_ruler_id(session, user_id)
-    
-    if not country:
-        await callback.answer("🚫 Вы не правитель этой страны!", show_alert=True)
+    if not country_id:
+        await callback.answer("❌ Сессия устарела", show_alert=True)
+        await state.clear()
         return
     
-    action = callback.data.split(":")[1]
+    country = await get_country_by_ruler_id(session, user_id)
+    if not country or country.country_id != country_id:
+        await callback.answer("🚫 Отказано в доступе", show_alert=True)
+        return
     
     match action:
-        case "name":
-            await state.set_state(CountryEditStates.edit_memename)
+        case "edit_name":
+            await state.set_state(CountryEditStates.edit_name)
             await callback.message.edit_text(
-                f"📝 <b>Изменение названия страны</b>\n\n"
-                f"Текущее название: {country.name}\n"
-                f"Введите новое название (максимум 100 символов):",
-                parse_mode="HTML"
+                f"📝 <b>Название: {country.name}</b>\nВведите новое:",
+                parse_mode="HTML", reply_markup=cancel_inline_keyboard()
             )
-        
-        case "ideology":
+        case "edit_ideology":
             await state.set_state(CountryEditStates.edit_ideology)
             await callback.message.edit_text(
-                f"🎭 <b>Изменение идеологии страны</b>\n\n"
-                f"Текущая идеология: {country.ideology}\n"
-                f"Введите новую идеологию (3-50 символов):",
-                parse_mode="HTML"
+                f"🎭 <b>Идеология: {country.ideology}</b>\nВведите новую:",
+                parse_mode="HTML", reply_markup=cancel_inline_keyboard()
             )
-        
-        case "map":
-            await state.set_state(CountryEditStates.edit_map_url)
+        case "edit_map":
+            await state.set_state(CountryEditStates.edit_map)
             await callback.message.edit_text(
-                f"🗺 <b>Изменение карты страны</b>\n\n"
-                f"Текущая карта: {country.map_url or 'Не указана'}\n"
-                f"Введите новую ссылку на карту или '-' если нет карты:",
-                parse_mode="HTML"
+                f"🗺 <b>Карта: {country.map_url or '-'}</b>\nВведите URL:",
+                parse_mode="HTML", reply_markup=cancel_inline_keyboard()
             )
-        
-        case "description":
+        case "edit_description":
             await state.set_state(CountryEditStates.edit_description)
             await callback.message.edit_text(
-                f"📜 <b>Изменение описания страны</b>\n\n"
-                f"Текущее описание: {country.description}\n"
-                f"Введите новое описание (максимум 1000 символов):",
-                parse_mode="HTML"
+                f"📜 <b>Описание</b>\nВведите новое:",
+                parse_mode="HTML", reply_markup=cancel_inline_keyboard()
             )
-        
-        case "flag":
-            await state.set_state(CountryCreateStates.waiting_for_flag)
+        case "edit_flag":
+            await state.set_state(CountryEditStates.edit_flag)
             await callback.message.edit_text(
-                f"🖼 <b>Изменение флага страны</b>\n\n"
-                "Отправьте новое изображение для флага:",
-                parse_mode="HTML"
+                "🖼 <b>Флаг</b>\nОтправьте изображение:",
+                parse_mode="HTML", reply_markup=cancel_inline_keyboard()
             )
-            await callback.answer()
-            return
-        
-        case "cancel":
+        case "edit_country_url":
+            await state.set_state(CountryEditStates.edit_country_url)
+            await callback.message.edit_text(
+                f"🔗 <b>Ссылка: {country.country_url or '-'}</b>\nВведите новую ссылку:",
+                parse_mode="HTML", reply_markup=cancel_inline_keyboard()
+            )
+        case "edit_back_to_menu":
+            await state.set_state(CountryEditStates.choose_field)
+            await callback.message.edit_text(
+                    f"🔧 <b>Редактирование: {country.name}</b>\n\nВыберите поле:",
+                    parse_mode="HTML", 
+                    reply_markup=country_edit_menu()
+                )
+
+        case "edit_cancel_inline":
             await state.clear()
-            await callback.message.edit_text("❌ Редактирование отменено.")
-            await callback.answer()
-            return
+            await callback.message.edit_text(
+                "❌ Редактирование завершено.",
+                reply_markup=None
+            )
     
     await callback.answer()
 
-
-# Редактирование названия
-@country_create_router.message(CountryEditStates.edit_memename, F.text)
-async def process_edit_name(message: types.Message, state: FSMContext, session: AsyncSession):
-    user_id = message.from_user.id
+@country_create_router.message(CountryEditStates.edit_name, F.text)
+async def edit_name_handler(message: types.Message, state: FSMContext, session: AsyncSession):
     new_name = message.text.strip()
     
-    if len(new_name) > 100:
-        await message.answer("⚠️ Название слишком длинное (максимум 100 символов).")
+    if not (2 <= len(new_name) <= 100):
+        await message.answer("⚠️ Длина названия: 2-100 символов!")
         return
+
+    data = await state.get_data()
+    menu_msg_id = data.get('menu_msg_id')
     
-    # Проверяем, что пользователь является правителем через requests.py
-    country = await get_country_by_ruler_id(session, user_id)
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
+    try:
+        success, msg = await edit_country_name(session, message.from_user.id, new_name)
+        
+        # Удаляем сообщение юзера, чтобы не мусорить в РП-чате
+        await message.delete() 
+
+        if success:
+            # ПЕРЕВОДИМ стейт обратно в выбор поля
+            await state.set_state(CountryEditStates.choose_field)
+            
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_msg_id,
+                text=f"✅ Название изменено на: <b>{new_name}</b>\n\nВыберите следующее поле для правки:",
+                parse_mode="HTML",
+                reply_markup=country_edit_menu() # Сразу возвращаем ГЛАВНОЕ меню
+            )
+        else:
+            await message.answer(f"❌ {msg}")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+
+@country_create_router.message(CountryEditStates.edit_country_url, F.text)
+async def edit_country_url_handler(message: types.Message, state: FSMContext, session: AsyncSession):
+    new_url = message.text.strip()
+
+    if not new_url:
+        await message.answer("⚠️ Ссылка не может быть пустой!")
         return
-    
-    success, msg = await edit_country_name(session, user_id, new_name)
-    await message.answer(msg)
-    await state.clear()
 
-@country_create_router.message(CountryEditStates.edit_memename)
-async def process_edit_name_invalid(message: types.Message):
-    await message.answer("⚠️ Пожалуйста, введите <b>текст</b>.")
+    data = await state.get_data()
+    menu_msg_id = data.get('menu_msg_id')
 
-# Редактирование идеологии
+    try:
+        success, msg = await edit_country_url(session, message.from_user.id, new_url)
+
+        if success:
+            await state.set_state(CountryEditStates.choose_field)
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_msg_id,
+                text=f"✅ {msg}\n\nВыберите следующее поле для правки:",
+                parse_mode="HTML",
+                reply_markup=country_edit_menu()
+            )
+        else:
+            await message.answer(f"❌ {msg}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+
 @country_create_router.message(CountryEditStates.edit_ideology, F.text)
-async def process_edit_ideology(message: types.Message, state: FSMContext, session: AsyncSession):
-    user_id = message.from_user.id
+async def edit_ideology_handler(message: types.Message, state: FSMContext, session: AsyncSession):
     new_ideology = message.text.strip()
     
     if not (3 <= len(new_ideology) <= 50):
-        await message.answer("⚠️ Идеология должна быть длиной от 3 до 50 символов.")
+        await message.answer("⚠️ Идеология должна быть длиной от 3 до 50 символов!")
         return
-    
-    # Проверяем, что пользователь является правителем через requests.py
-    country = await get_country_by_ruler_id(session, user_id)
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    success, msg = await edit_country_ideology(session, user_id, new_ideology)
-    await message.answer(msg)
-    await state.clear()
 
-@country_create_router.message(CountryEditStates.edit_ideology)
-async def process_edit_ideology_invalid(message: types.Message):
-    await message.answer("⚠️ Пожалуйста, введите <b>текст</b>.")
-
-# Редактирование карты
-@country_create_router.message(CountryEditStates.edit_map_url, F.text)
-async def process_edit_map_url(message: types.Message, state: FSMContext, session: AsyncSession):
-    user_id = message.from_user.id
-    new_map_url = message.text.strip()
-    final_map_url = None if new_map_url == '-' else new_map_url
+    data = await state.get_data()
+    menu_msg_id = data.get('menu_msg_id')
     
-    # Проверяем, что пользователь является правителем через requests.py
-    country = await get_country_by_ruler_id(session, user_id)
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    success, msg = await edit_country_map_url(session, user_id, new_map_url)
-    await message.answer(msg)
-    await state.clear()
+    try:
+        success, msg = await edit_country_ideology(session, message.from_user.id, new_ideology)
+        
+        if success:
+            await state.set_state(CountryEditStates.choose_field)
+            
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_msg_id,
+                text=f"✅ Идеология изменена на: <b>{new_ideology}</b>\n\nВыберите следующее поле для правки:",
+                parse_mode="HTML",
+                reply_markup=country_edit_menu()
+            )
+        else:
+            await message.answer(f"❌ {msg}")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
-@country_create_router.message(CountryEditStates.edit_map_url)
-async def process_edit_map_url_invalid(message: types.Message):
-    await message.answer("⚠️ Пожалуйста, введите <b>текст</b> или '-'.")
-
-
-# Редактирование описания
 @country_create_router.message(CountryEditStates.edit_description, F.text)
-async def process_edit_description(message: types.Message, state: FSMContext, session: AsyncSession):
-    user_id = message.from_user.id
+async def edit_description_handler(message: types.Message, state: FSMContext, session: AsyncSession):
     new_description = message.text.strip()
     
-    if len(new_description) > 1000:
-        await message.answer("⚠️ Описание слишком длинное (максимум 1000 символов).")
+    if not (1 <= len(new_description) <= 1000):
+        await message.answer("⚠️ Описание должно быть длиной от 1 до 1000 символов!")
         return
-    
-    # Проверяем, что пользователь является правителем через requests.py
-    country = await get_country_by_ruler_id(session, user_id)
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    success, msg = await edit_country_description(session, user_id, new_description)
-    await message.answer(msg)
-    await state.clear()
 
-@country_create_router.message(CountryEditStates.edit_description)
-async def process_edit_description_invalid(message: types.Message):
-    await message.answer("⚠️ Пожалуйста, введите <b>текст</b>.")
+    data = await state.get_data()
+    menu_msg_id = data.get('menu_msg_id')
+    
+    try:
+        success, msg = await edit_country_description(session, message.from_user.id, new_description)
+        
+        if success:
+            await state.set_state(CountryEditStates.choose_field)
+            
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_msg_id,
+                text=f"✅ Описание изменено на: <b>{new_description}</b>\n\nВыберите следующее поле для правки:",
+                parse_mode="HTML",
+                reply_markup=country_edit_menu()
+            )
+        else:
+            await message.answer(f"❌ {msg}")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
-# Обработка отмены редактирования
-@country_create_router.message(Command("cancel"))
-async def cmd_cancel_edit(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        return
+@country_create_router.message(CountryEditStates.edit_map, F.text)
+async def edit_map_handler(message: types.Message, state: FSMContext, session: AsyncSession):
+    new_map_url = message.text.strip()
     
-    await state.clear()
-    await message.answer("❌ Редактирование отменено.")
+    data = await state.get_data()
+    menu_msg_id = data.get('menu_msg_id')
+    
+    try:
+        success, msg = await edit_country_map_url(session, message.from_user.id, new_map_url)
+        
+        if success:
+            await state.set_state(CountryEditStates.choose_field)
+            
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_msg_id,
+                text=f"✅ Ссылка на карту изменена на: <b>{new_map_url}</b>\n\nВыберите следующее поле для правки:",
+                parse_mode="HTML",
+                reply_markup=country_edit_menu()
+            )
+        else:
+            await message.answer(f"❌ {msg}")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
-
-# ==========================================
-# G. БЫСТРОЕ РЕДАКТИРОВАНИЕ ЧЕРЕЗ АРГУМЕНТЫ
-# ==========================================
-
-@country_create_router.message(Command("setname"))
-async def cmd_set_name(message: types.Message, session: AsyncSession, command: CommandObject):
-    user_id = message.from_user.id
+@country_create_router.message(CountryEditStates.edit_flag, F.photo)
+async def edit_flag_handler(message: types.Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    photo = message.photo[-1]
+    file_id = photo.file_id
     
-    if not command.args:
-        await message.answer("❗ Введите новое название: /setname Новое Название")
-        return
+    data = await state.get_data()
+    menu_msg_id = data.get('menu_msg_id')
     
-    new_name = command.args.strip()
-    
-    # Проверяем, что пользователь является правителем
-    country = await session.scalar(
-        select(MemeCountry).where(MemeCountry.ruler_id == user_id)
-    )
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    if len(new_name) > 100:
-        await message.answer("⚠️ Название слишком длинное (максимум 100 символов).")
-        return
-    
-    old_name = country.name
-    country.name = new_name
-    
-    await message.answer(
-        f"✅ Название успешно изменено!\n"
-        f"Было: {old_name}\n"
-        f"Стало: {new_name}"
-    )
-
-@country_create_router.message(Command("setideology"))
-async def cmd_set_ideology(message: types.Message, session: AsyncSession, command: CommandObject):
-    user_id = message.from_user.id
-    
-    if not command.args:
-        await message.answer("❗ Введите новую идеологию: /setideology Новая Идеология")
-        return
-    
-    new_ideology = command.args.strip()
-    
-    # Проверяем, что пользователь является правителем
-    country = await session.scalar(
-        select(MemeCountry).where(MemeCountry.ruler_id == user_id)
-    )
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    if not (3 <= len(new_ideology) <= 50):
-        await message.answer("⚠️ Идеология должна быть длиной от 3 до 50 символов.")
-        return
-    
-    old_ideology = country.ideology
-    country.ideology = new_ideology
-    
-    await message.answer(
-        f"✅ Идеология успешно изменена!\n"
-        f"Было: {old_ideology}\n"
-        f"Стало: {new_ideology}"
-    )
-
-@country_create_router.message(Command("setdescription"))
-async def cmd_set_description(message: types.Message, session: AsyncSession, command: CommandObject):
-    user_id = message.from_user.id
-    
-    if not command.args:
-        await message.answer("❗ Введите новое описание: /setdescription Новое Описание")
-        return
-    
-    new_description = command.args.strip()
-    
-    # Проверяем, что пользователь является правителем
-    country = await session.scalar(
-        select(MemeCountry).where(MemeCountry.ruler_id == user_id)
-    )
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    if len(new_description) > 1000:
-        await message.answer("⚠️ Описание слишком длинное (максимум 1000 символов).")
-        return
-    
-    old_description = country.description
-    country.description = new_description
-    
-    await message.answer(
-        f"✅ Описание успешно изменено!\n"
-        f"Было: {old_description}\n"
-        f"Стало: {new_description}"
-    )
-
-@country_create_router.message(Command("setmap"))
-async def cmd_set_map(message: types.Message, session: AsyncSession, command: CommandObject):
-    user_id = message.from_user.id
-    
-    if not command.args:
-        await message.answer("❗ Введите ссылку на карту: /setmap https://example.com/map")
-        return
-    
-    new_map_url = command.args.strip()
-    final_map_url = None if new_map_url == '-' else new_map_url
-    
-    # Проверяем, что пользователь является правителем
-    country = await session.scalar(
-        select(MemeCountry).where(MemeCountry.ruler_id == user_id)
-    )
-    
-    if not country:
-        await message.answer("🚫 Вы не правитель этой страны!")
-        return
-    
-    old_map_url = country.map_url
-    
-    country.map_url = final_map_url
-    
-    old_display = old_map_url or "Не указана"
-    new_display = final_map_url or "Не указана"
-    
-    await message.answer(
-        f"✅ Карта успешно изменена!\n"
-        f"Было: {old_display}\n"
-        f"Стало: {new_display}"
-    )
-
-@country_create_router.message(Command("setflag"))
-async def cmd_set_flag_fsm(message: types.Message, state: FSMContext, **kwargs):
-    """Начало процесса установки флага через FSM"""
-    await state.set_state(CountryCreateStates.waiting_for_flag)
-    await message.answer(
-        "🖼 <b>Отправьте изображение</b>, которое станет флагом вашей страны.\n\n"
-        "<i>Совет: лучше использовать квадратные изображения.</i>",
-        parse_mode="HTML"
-    )
-
+    try:
+        success, msg = await edit_country_flag(session, message.from_user.id, file_id, bot)
+        
+        if success:
+            await state.set_state(CountryEditStates.choose_field)
+            
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_msg_id,
+                text=f"✅ Флаг изменен!\n{msg}\n\nВыберите следующее поле для правки:",
+                parse_mode="HTML",
+                reply_markup=country_edit_menu()
+            )
+        else:
+            await message.answer(f"❌ {msg}")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
 # ==========================================
 # 2. ХЕНДЛЕР: ВСТУПЛЕНИЕ В СТРАНУ (/join)
@@ -712,10 +569,9 @@ async def cmd_set_flag_fsm(message: types.Message, state: FSMContext, **kwargs):
 async def cmd_join_country_explicit(
     message: types.Message,
     session: AsyncSession,
-    command: CommandObject
+    command: CommandObject,
+    user: User  # ✅ User из middleware
 ):
-    user_id = message.from_user.id
-    
     if not command.args:
         await message.answer(
             "🚫 <b>Укажите ID или название страны.</b>\n"
@@ -726,24 +582,22 @@ async def cmd_join_country_explicit(
         )
         return
         
-    # Просто берем всё, что ввел пользователь после команды
     user_input = command.args.strip()
     
-    # Автоматически определяем метод поиска
+    # Определяем тип поиска
     if user_input.isdigit():
-        search_method = "id"
-        search_value = user_input
+        country_id = int(user_input)
+        query_name = None
     else:
-        search_method = "name"
-        search_value = user_input
+        country_id = None
+        query_name = user_input
 
     try:
-        # Вызываем твою логику вступления
         success, response_text = await join_country(
-            session=session, 
-            user_id=user_id, 
-            search_method=search_method,
-            search_value=search_value
+            session=session,
+            user=user,           # ✅ Объект User, не user_id
+            country_id=country_id,
+            query_name=query_name
         )
 
         await message.answer(response_text, parse_mode=ParseMode.HTML)
@@ -754,27 +608,26 @@ async def cmd_join_country_explicit(
             "❌ <b>Произошла критическая ошибка.</b>\nПопробуйте позже.",
             parse_mode=ParseMode.HTML
         )
-    
-        # лог — обязательно
-    logging.exception("Ошибка в /join")
+
 # ==========================================
 # 3. ХЕНДЛЕР: ВЫХОД ИЗ СТРАНЫ (/leave)
 # ==========================================
-
 @country_create_router.message(Command("leave"))
-async def cmd_leave_country(message: types.Message, session: AsyncSession):
+async def cmd_leave_country(
+    message: types.Message,
+    session: AsyncSession,
+    user: User  # ✅ User из middleware
+):
     """Позволяет пользователю покинуть текущую мемную страну."""
-    user_id = message.from_user.id
-    
     try:
         success, msg, country_name = await leave_country(
             session=session,
-            user_id=user_id
+            user_id=user.user_id  # ✅ user_id из объекта User
         )
         
         if success:
             await message.answer(
-                f"👋 Вы успешно покинули страну **{country_name}**.", 
+                f"👋 Вы успешно покинули страну <b>{country_name}</b>.", 
                 parse_mode='HTML'
             )
         else:
@@ -783,7 +636,6 @@ async def cmd_leave_country(message: types.Message, session: AsyncSession):
     except Exception as e:
         logger.error("Ошибка при выполнении команды /leave: %s", e)
         await message.answer("⛔️ Произошла системная ошибка при выходе. Попробуйте позже.")
-
 
 # ==========================================
 # 4. ХЕНДЛЕР: МОЯ СТРАНА (/mycountry)
@@ -968,58 +820,61 @@ async def cmd_kick_user(message: types.Message, session: AsyncSession, **kwargs)
     success, msg = await kick_user(session, user.user_id, target_user.user_id)
     await message.answer(f"🦶 {msg}")
 # ==========================================
-# 10. УСТАНОВКА НАЛОГА (/setposition)
+# 10. УСТАНОВКА Должности (/setposition)
 # ==========================================
 @country_create_router.message(Command("setposition"))
-async def cmd_set_position(message: Message, session: AsyncSession, command: CommandObject, **kwargs):
-    success, country, user = await check_ruler_permissions(message, session)
-    if not success:
-        return
-        
-    if not command.args:
-        await message.answer("❗ Формат: /setposition <должность> [id|@username|reply]")
-        return
+async def cmd_set_position(message: Message, session: AsyncSession, command: CommandObject, user: User):
+    """
+    Установка должности с использованием Match-Case.
+    """
+    # 1. Проверка прав (используем уже подгруженного user из Middleware)
+    if not user.ruled_country_list:
+        return await message.answer("❗ Вы не являетесь правителем страны.")
 
-    # Разбираем аргументы
-    args = command.args.strip().split()
-    
-    if len(args) < 1:
-        await message.answer("❗ Введите название должности.")
-        return
-    
-    pos_name = args[0]
+    # 2. Подготовка аргументов
+    args = command.args.split() if command.args else []
     target_id = None
-    
-    # Ищем цель: сначала в аргументах, потом в реплае
-    if len(args) > 1:
-        target_arg = args[1]
-        
-        # Если это ID
-        if target_arg.isdigit():
-            target_id = int(target_arg)
-        # Если это username
-        elif target_arg.startswith('@'):
-            username = target_arg[1:]
-            target_user = await session.execute(
-                select(User).where(User.username == username)
-            )
-            target_user = target_user.scalar_one_or_none()
-            if target_user:
-                target_id = target_user.user_id
-    # Если не нашли в аргументах, ищем в реплае
-    elif message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-    
-    if not target_id:
-        await message.answer("❗ Укажите цель: /setposition <должность> [id|@username|reply]")
-        return
-    
-    if target_id == user.user_id:
-        await message.answer("❗ Нельзя назначить должность самому себе.")
-        return
+    pos_name = None
 
-    # Вызываем запрос. Автокоммит в миддлвари всё сохранит.
-    res_msg = await set_position(session, user.user_id, target_id, pos_name)
+    # 3. Магия Match-Case
+    match args:
+        # Случай: /setposition (пусто)
+        case []:
+            return await message.answer("❗ Формат: <code>/setposition [должность] [id|@username|reply]</code>")
+
+        # Случай: /setposition [название] (через REPLY)
+        case [*name_parts] if message.reply_to_message:
+            target_id = message.reply_to_message.from_user.id
+            pos_name = " ".join(name_parts)
+
+        # Случай: /setposition [название] @username
+        case [*name_parts, target] if target.startswith("@"):
+            # Ищем ID по юзернейму
+            stmt = select(User.user_id).where(User.username == target[1:])
+            target_id = await session.scalar(stmt)
+            pos_name = " ".join(name_parts)
+
+        # Случай: /setposition [название] ID
+        case [*name_parts, target] if target.isdigit():
+            target_id = int(target)
+            pos_name = " ".join(name_parts)
+
+        # Если ничего не подошло
+        case _:
+            return await message.answer("❗ Не удалось распознать цель. Укажите @username, ID или ответьте на сообщение.")
+
+    # 4. Финальные проверки перед записью
+    if not target_id or not pos_name:
+        return await message.answer("❗ Ошибка: не указана должность или пользователь.")
+
+    if target_id == user.user_id:
+        return await message.answer("❗ Вы не можете назначить должность самому себе.")
+
+    # 5. Выполнение логики
+    # Передаем ID страны правителя для проверки принадлежности цели к стране
+    country_id = user.ruled_country_list[0].country_id
+    res_msg = await set_position(session, country_id, target_id, pos_name)
+    
     await message.answer(f"✅ {res_msg}")
 # ==========================================
 # 11. ТОП СТРАН (/globalstats)

@@ -2,7 +2,6 @@ import os
 import sys
 import ast # Для безопасного чтения списков из текстового файла
 from dotenv import load_dotenv
-
 # 1. FIX PATH (добавление пути, как вы просили)
 # Это нужно для корректных относительных импортов
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -25,29 +24,30 @@ def generate_symbols_data(symbols, base_mult, mult_step, base_weight, weight_ste
         # Вес падает (реже выпадает): base + step * index
         # Используем max(1, ...) чтобы вес всегда был минимум 1.
         weight = max(1, base_weight + weight_step * i) 
-        weights.append(weight)
+        weights.append(base_weight / (weight_step ** i))
         
     return multipliers, weights
 
 def read_config_txt(path="config.txt"):
     """Читает конфигурационные переменные из файла config.txt."""
     config = {}
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(script_dir, path)
+    
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(full_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
                 
-                # Удаляем часть строки, которая является комментарием
                 if '#' in line:
                     line = line.split('#', 1)[0].strip()
-                    if not line: # Если остался только комментарий, пропускаем
+                    if not line:
                         continue
                         
                 if "=" in line:
                     key, value = line.split("=", 1)
-                    # Убедимся, что значение также очищено от лишних пробелов
                     config[key.strip()] = value.strip() 
     except FileNotFoundError:
         pass
@@ -68,7 +68,7 @@ def get_standard_settings() -> dict:
         "MIN_POINTS_TO_CREATE_COUNTRY": 500,
         "COUNTRY_CREATION_COOLDOWN_HOURS": 72,
 
-        # 🔥 НОВАЯ КОНСТАНТА: Бонус за Влияние
+        #Бонус за Влияние
         "DAILY_BONUS_RATIO": 100, 
 
         # --- Настройки Казино (Параметры для 1x3) ---
@@ -76,9 +76,9 @@ def get_standard_settings() -> dict:
         "CASINO_BASE_MULT": 2.0,
         "CASINO_MULT_STEP": 1.0,
         "CASINO_BASE_WEIGHT": 30,
-        "CASINO_WEIGHT_STEP": -5,
+        "CASINO_WEIGHT_DIVISOR": 2.5,
         
-        # 🔥 НОВЫЙ БЛОК: Настройки Казино (Параметры для 3x3)
+        #Настройки Казино (Параметры для 3x3)
         "SLOT3X3_SYMBOLS": '["🟡", "🟢", "🔴", "💎"]',
         "SLOT3X3_BASE_MULT": 1.0,                    
         "SLOT3X3_MULT_STEP": 2.0,                    
@@ -120,18 +120,43 @@ FUZZY_MATCH_THRESHOLD = int(CONFIG["FUZZY_MATCH_THRESHOLD"])
 RP_TO_INFLUENCE_RATIO = int(CONFIG["RP_TO_INFLUENCE_RATIO"])
 MIN_POINTS_TO_CREATE_COUNTRY = int(CONFIG["MIN_POINTS_TO_CREATE_COUNTRY"])
 COUNTRY_CREATION_COOLDOWN_HOURS = int(CONFIG["COUNTRY_CREATION_COOLDOWN_HOURS"])
-# 🔥 НОВАЯ КОНСТАНТА
 DAILY_BONUS_RATIO = int(CONFIG["DAILY_BONUS_RATIO"])
 REVIEW_COOLDOWN_DAYS = int(CONFIG.get("REVIEW_COOLDOWN_DAYS", 7))  # Новая константа для оценки страны
+
+def parse_emoji_list(s):
+    """
+    Парсит список эмодзи из строки, например:
+    '["🌚", "⚡", "💎"]' -> ['🌚', '⚡', '💎']
+    """
+    s = s.strip()
+    if not s.startswith('[') or not s.endswith(']'):
+        return []
+    
+    # Удаляем квадратные скобки
+    s = s[1:-1]
+    
+    # Разделяем по запятым
+    items = [item.strip() for item in s.split(',')]
+    
+    # Убираем кавычки (если есть)
+    result = []
+    for item in items:
+        item = item.strip()
+        if item.startswith('"') and item.endswith('"'):
+            item = item[1:-1]
+        elif item.startswith("'") and item.endswith("'"):
+            item = item[1:-1]
+        if item:
+            result.append(item)
+    
+    return result
 
 # 3. Казино 1x3: Парсинг и Генерация
 SLOT_SYMBOLS_RAW = CONFIG["SLOT_SYMBOLS"]
 try:
-    # Безопасное чтение списка
-    SLOT_SYMBOLS = ast.literal_eval(SLOT_SYMBOLS_RAW)
+    SLOT_SYMBOLS = parse_emoji_list(SLOT_SYMBOLS_RAW)
 except:
-    # Используем дефолтный список, если не удалось распарсить
-    SLOT_SYMBOLS = ast.literal_eval(STANDARD["SLOT_SYMBOLS"])
+    SLOT_SYMBOLS = parse_emoji_list(STANDARD["SLOT_SYMBOLS"])
 
 # Генерация финальных констант для 1x3:
 SYMBOL_MULTIPLIERS, SYMBOL_WEIGHTS = generate_symbols_data(
@@ -139,15 +164,15 @@ SYMBOL_MULTIPLIERS, SYMBOL_WEIGHTS = generate_symbols_data(
     base_mult=float(CONFIG["CASINO_BASE_MULT"]),
     mult_step=float(CONFIG["CASINO_MULT_STEP"]),
     base_weight=int(CONFIG["CASINO_BASE_WEIGHT"]),
-    weight_step=int(CONFIG["CASINO_WEIGHT_STEP"])
+    weight_step=float(CONFIG["CASINO_WEIGHT_DIVISOR"])
 )
 
-# 4. 🔥 НОВЫЙ БЛОК: Казино 3x3: Парсинг и Генерация
+# 4. Казино 3x3: Парсинг и Генерация
 SLOT3X3_SYMBOLS_RAW = CONFIG["SLOT3X3_SYMBOLS"]
 try:
-    SLOT3X3_SYMBOLS = ast.literal_eval(SLOT3X3_SYMBOLS_RAW)
+    SLOT3X3_SYMBOLS = parse_emoji_list(SLOT3X3_SYMBOLS_RAW)
 except:
-    SLOT3X3_SYMBOLS = ast.literal_eval(STANDARD["SLOT3X3_SYMBOLS"])
+    SLOT3X3_SYMBOLS = parse_emoji_list(STANDARD["SLOT3X3_SYMBOLS"])
 
 SLOT3X3_MULTIPLIERS, SLOT3X3_WEIGHTS = generate_symbols_data(
     SLOT3X3_SYMBOLS,

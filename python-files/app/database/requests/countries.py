@@ -1,11 +1,15 @@
 """
 Функции для работы с мемными странами.
 """
+import os
+import aiofiles
 import logging
+from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, desc, func, and_, delete, cast, Integer
 from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional, Tuple
 from thefuzz import fuzz
 
@@ -78,12 +82,11 @@ async def assign_ruler(session: AsyncSession, user_id: int, country_id: int) -> 
     user.last_country_creation = datetime.now() 
 
     return True, f"Да здравствует новый правитель {country.name} — {user.userfullname}!"
+
+
 async def get_country_by_name(session: AsyncSession, name: str) -> MemeCountry | None:
-    """
-    Находит страну по ее названию, не учитывая регистр.
-    """
-    # Используем func.lower() для поиска без учета регистра
-    stmt = select(MemeCountry).where(
+    """Находит страну по названию с подгруженным правителем."""
+    stmt = select(MemeCountry).options(selectinload(MemeCountry.ruler)).where(
         func.lower(MemeCountry.name) == func.lower(name)
     )
     result = await session.execute(stmt)
@@ -237,119 +240,67 @@ async def donate_to_country_treasury(session: AsyncSession, user_id: int, amount
 # ==========================================
 # 2.1 ВСТУПЛЕНИЕ В СТРАНУ (JOIN COUNTRY)
 # ==========================================
-
 async def join_country(
     session: AsyncSession,
-    user_id: int,
-    search_method: str,
-    search_value: str
+    user: User,              # Получаем уже готовый объект User
+    country_id: int | None = None,
+    query_name: str | None = None
 ) -> tuple[bool, str]:
-    """
-    Полная логика вступления в страну.
-    Авторегистрация новичков, защита от правителей, рофлы и история.
-    """
-    # 1. Гарантированно получаем профиль (создаёт, если нет)
-    profile, was_created = await db_ensure_full_user_profile(
-        session=session,
-        user_id=user_id,
-        username="",  # Можно передать из message, если хочешь точные данные
-        userfullname=""
-    )
-
-    if profile is None:
-        return False, "❌ Внутренняя ошибка при загрузке профиля. Попробуйте позже."
-
-    user = profile  # Теперь user — полностью загруженный объект
-
-    # Приветствие новичку
-    extra_msg = ""
-    if was_created:
-        extra_msg = "👋 Вы автоматически зарегистрированы в системе!\nДобро пожаловать в мир мемных стран 🎉\n\n"
-
-    # 2. Блокировка для правителей
+    # 1. Блокировка для правителей (уже подгружено в user)
     if user.ruled_country_list:
-        return False, (
-            "🚫 Вы — уже правитель страны.\n"
-            "Пока у вас есть власть(хихихиха), вступить в другую страну нельзя.\n"
-            "Удалите или передайте свою страну сначала."
-        )
+        return False, "🚫 Ты правитель. Сначала передай власть (/transferpower)."
 
-    # 3. Поиск страны
+    # 2. Определение целевой страны
     target_country = None
-    if search_method == "id":
-        try:
-            target_id = int(search_value)
-            target_country = await session.get(MemeCountry, target_id)
-        except ValueError:
-            return False, "🚫 ID страны должен быть числом."
-
-    elif search_method == "name":
-        target_country = await find_country_by_fuzzy_name(session, search_value)
-    else:
-        return False, "🚫 Неизвестный метод. Используйте <code>id</code> или <code>name</code>."
+    if country_id:
+        target_country = await session.get(MemeCountry, country_id)
+    elif query_name:
+        target_country = await find_country_by_fuzzy_name(session, query_name)
 
     if not target_country:
-        return False, f"❌ Страна не найдена по запросу: <b>{search_value}</b>"
+        return False, f"❌ Страна не найдена."
 
-    # 4. Уже в этой стране?
+    # 3. Проверка: уже в этой стране?
     if user.country_id == target_country.country_id:
-        return False, f"ℹ️ Вы уже гражданин <b>{hbold(target_country.name)}</b>."
+        return False, f"ℹ️ Вы уже гражданин <b>{target_country.name}</b>."
 
-    # 5. Определяем тип события и текст
+    # 4. Логика смены/вступления
     old_country_name = None
     if user.country_id:
         old_country = await session.get(MemeCountry, user.country_id)
         if old_country:
             old_country_name = old_country.name
 
-    # Гарантируем определение event_type
     if old_country_name:
         event_type = "CHANGE_COUNTRY"
         reason = f"Смена страны: {old_country_name} → {target_country.name}"
-        welcome_text = (
-            f"✅ Вы сменили гражданство!\n"
-            f"Теперь вы гражданин <b>{target_country.name}</b>.\n"
-            f"Предательство? Или поиск лучшей жизни? 🤔"
-        )
+        welcome_text = f"✅ Вы сменили гражданство на <b>{target_country.name}</b>!"
     else:
         event_type = "JOIN_COUNTRY"
         reason = f"Вступление в страну: {target_country.name}"
-        welcome_text = (
-            f"✅ Добро пожаловать в <b>{target_country.name}</b>!\n"
-            f"Теперь вы официальный гражданин 🎉"
-        )
-    
-    # Дополнительная проверка для надежности
-    if event_type is None:
-        event_type = "JOIN_COUNTRY"  # Значение по умолчанию
-        reason = f"Вступление в страну: {target_country.name}"
+        welcome_text = f"✅ Добро пожаловать в <b>{target_country.name}</b>!"
 
-    # 6. Обновляем пользователя
+    # 5. Обновляем пользователя
     user.country_id = target_country.country_id
     user.position = "Гражданин"
 
-    # 7. Записываем в историю
+    # 6. Записываем в историю
     session.add(History(
-        admin_id=None,
-        target_id=user_id,
+        target_id=user.user_id,
         event_type=event_type,
-        points=0,
         reason=reason
     ))
-
     await session.flush()
 
-    # 8. Финальный текст с приветствием новичку
-    final_text = extra_msg + welcome_text
-    return True, final_text
+    return True, welcome_text
 
 async def find_country_by_fuzzy_name(session: AsyncSession, query: str) -> Optional[MemeCountry]:
-    """Находит страну по названию или мем-имени. 75 — идеальный порог для 50–70 стран."""
+    """Находит страну по названию или мем-имени."""
     query = query.strip().lower()
     if len(query) < 2:
         return None
 
-    # Берём только нужные поля — быстро и без тормозов
+    # Быстрый селект только нужных полей
     result = await session.execute(
         select(MemeCountry.country_id, MemeCountry.name, MemeCountry.memename)
     )
@@ -359,10 +310,9 @@ async def find_country_by_fuzzy_name(session: AsyncSession, query: str) -> Optio
         return None
 
     best_match = None
-    best_score = FUZZY_MATCH_THRESHOLD  # у тебя 75 в конфиге — идеально!
+    best_score = 75  # Твой порог из конфига
 
     for country_id, name, memename in countries:
-        # Ищем по названию И по мем-имени
         score1 = fuzz.token_sort_ratio(query, name.lower())
         score2 = fuzz.token_sort_ratio(query, (memename or "").lower())
         score = max(score1, score2)
@@ -370,10 +320,10 @@ async def find_country_by_fuzzy_name(session: AsyncSession, query: str) -> Optio
         if score > best_score:
             best_score = score
             best_match = await session.get(MemeCountry, country_id)
-
-
+            
+    return best_match
 # ==========================================
-# 2.2 ВЫХОД ИЗ СТРАНЫ (LEAVE COUNTRY / LEAVE)
+#ВЫХОД ИЗ СТРАНЫ (LEAVE COUNTRY / LEAVE)
 # ==========================================
 async def leave_country(session: AsyncSession, user_id: int) -> tuple[bool, str, str | None]:
     """
@@ -389,7 +339,6 @@ async def leave_country(session: AsyncSession, user_id: int) -> tuple[bool, str,
     result = await session.execute(stmt)
     user = result.scalar_one_or_none()
     
-    # Эта проверка должна выполняться, потому что мы не используем get_or_create_user здесь
     if not user:
          return False, "Пользователь не найден в базе.", None
 
@@ -398,7 +347,7 @@ async def leave_country(session: AsyncSession, user_id: int) -> tuple[bool, str,
     
     # Правитель не может просто "выйти", он должен отречься через /transferpower
     if user.is_ruler:
-        return False, "Вы правитель! Используйте команду передачи власти.", None
+        return False, "Вы правитель! Используйте команду передачи власти(/transferpower).", None
 
 
     country_name = user.country.name if user.country else "Неизвестная страна"
@@ -413,7 +362,7 @@ async def leave_country(session: AsyncSession, user_id: int) -> tuple[bool, str,
 
 
 # ==========================================
-# 5.5 ПЕРЕДАЧА ВЛАСТИ И УДАЛЕНИЕ СТРАНЫ
+#ПЕРЕДАЧА ВЛАСТИ И УДАЛЕНИЕ СТРАНЫ
 # ==========================================
 async def transfer_ruler(session: AsyncSession, old_ruler_id: int, new_ruler_id: int, country_id: int) -> tuple[bool, str]:
     """
@@ -567,28 +516,33 @@ async def set_tax_rate(session: AsyncSession, ruler_id: int, rate: float) -> tup
     return True, f"Налог установлен на {rate*100:.0f}%."
 
 async def get_all_countries(session: AsyncSession, page: int = 1, limit: int = 5) -> str:
-    """
-    Возвращает список стран с пагинацией.
-    """
+    """Возвращает список стран с пагинацией и именами правителей."""
     offset = (page - 1) * limit
     countries = await session.scalars(
-        select(MemeCountry).order_by(desc(MemeCountry.influence_points)).offset(offset).limit(limit)
+        select(MemeCountry)
+        .options(selectinload(MemeCountry.ruler))  # Подгружаем правителей сразу
+        .order_by(desc(MemeCountry.influence_points))
+        .offset(offset)
+        .limit(limit)
     )
     result = [f"📖 <b>СПИСОК СТРАН (стр. {page})</b>:"]
     for idx, c in enumerate(countries, start=offset+1):
-        result.append(f"{idx}. {escape_html(c.name)} — Влияние: {c.influence_points}")
+        ruler_name = c.ruler.userfullname if c.ruler else "Нет правителя"
+        result.append(f"{idx}. {escape_html(c.name)} — Влияние: {c.influence_points} (Правитель: {escape_html(ruler_name)})")
     return "\n".join(result)
 
 async def get_global_stats(session: AsyncSession, limit: int = 10) -> str:
-    """
-    Топ стран по влиянию.
-    """
+    """Топ стран по влиянию с именами правителей."""
     countries = await session.scalars(
-        select(MemeCountry).order_by(desc(MemeCountry.influence_points)).limit(limit)
+        select(MemeCountry)
+        .options(selectinload(MemeCountry.ruler))
+        .order_by(desc(MemeCountry.influence_points))
+        .limit(limit)
     )
     result = ["🏆 <b>ТОП СТРАН ПО ВЛИЯНИЮ</b>:"]
     for idx, c in enumerate(countries, 1):
-        result.append(f"{idx}. {escape_html(c.name)} — {c.influence_points}")
+        ruler_name = c.ruler.userfullname if c.ruler else "Нет правителя"
+        result.append(f"{idx}. {escape_html(c.name)} — {c.influence_points} (Правитель: {escape_html(ruler_name)})")
     return "\n".join(result)
 
 async def get_country_by_ruler_id(session: AsyncSession, ruler_id: int) -> MemeCountry | None:
@@ -597,6 +551,22 @@ async def get_country_by_ruler_id(session: AsyncSession, ruler_id: int) -> MemeC
         select(MemeCountry).where(MemeCountry.ruler_id == ruler_id)
     )
     return result
+#изменение параметров страны ------------------------------------------------
+async def edit_country_flag_local(session: AsyncSession, ruler_id: int, file_id: str) -> tuple[bool, str]:
+    """Сохраняет file_id флага локально"""
+    country = await get_country_by_ruler_id(session, ruler_id)
+    
+    if not country:
+        return False, "Вы не правитель."
+    
+    country.flag_file_id = file_id
+    return True, "Флаг обновлён!"
+
+async def get_country_flag(session: AsyncSession, country_id: int) -> Optional[str]:
+    """Получает file_id флага"""
+    country = await session.get(MemeCountry, country_id)
+    return country.flag_file_id if country else None
+
 
 async def edit_country_name(session: AsyncSession, ruler_id: int, new_name: str) -> tuple[bool, str]:
     """Изменяет название страны"""
@@ -668,18 +638,6 @@ async def edit_country_map_url(session: AsyncSession, ruler_id: int, new_map_url
     country.map_url = final_map_url
     return True, "Ссылка на карту успешно изменена."
 
-async def edit_country_flag(session: AsyncSession, ruler_id: int, new_flag_url: str) -> tuple[bool, str]:
-    """Изменяет флаг страны"""
-    country = await session.scalar(
-        select(MemeCountry).where(MemeCountry.ruler_id == ruler_id)
-    )
-    
-    if not country:
-        return False, "Вы не правитель."
-    
-    country.avatar_url = new_flag_url
-    return True, "Флаг страны успешно изменен."
-
 async def edit_country_memename(session: AsyncSession, ruler_id: int, new_memename: str) -> tuple[bool, str]:
     """Изменяет мемное имя страны"""
     if len(new_memename) > 100:
@@ -706,11 +664,36 @@ async def edit_country_memename(session: AsyncSession, ruler_id: int, new_memena
     country.memename = new_memename
     return True, f"Мемное имя страны успешно изменено на '{new_memename}'."
 
-async def edit_country_memename(session: AsyncSession, ruler_id: int, new_memename: str) -> tuple[bool, str]:
-    """Изменяет мемное имя страны"""
-    if len(new_memename) > 100:
-        return False, "Мемное имя слишком длинное (максимум 100 символов)."
-    
+
+async def edit_country_url(session: AsyncSession, ruler_id: int, new_url: str) -> tuple[bool, str]:
+    """Изменяет ссылку на страну."""
+    country = await session.scalar(
+        select(MemeCountry).where(MemeCountry.ruler_id == ruler_id)
+    )
+
+    if not country:
+        return False, "Вы не правитель."
+
+    country.country_url = new_url
+    return True, f"Ссылка страны успешно изменена на '{new_url}'."
+
+
+
+#======================================================================
+#Сохранение файлов
+#======================================================================
+async def download_telegram_file(bot: Bot, file_id: str, save_path: str) -> bool:
+    """Скачивает файл из Telegram"""
+    try:
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, save_path)
+        return True
+    except Exception as e:
+        print(f"Ошибка скачивания файла: {e}")
+        return False
+
+async def edit_country_flag(session: AsyncSession, ruler_id: int, file_id: str, bot: Bot) -> tuple[bool, str]:
+    """Изменяет флаг страны - скачивает и сохраняет локально"""
     country = await session.scalar(
         select(MemeCountry).where(MemeCountry.ruler_id == ruler_id)
     )
@@ -718,16 +701,21 @@ async def edit_country_memename(session: AsyncSession, ruler_id: int, new_memena
     if not country:
         return False, "Вы не правитель."
     
-    # Проверка на уникальность мемного имени
-    existing = await session.scalar(
-        select(MemeCountry).where(
-            func.lower(MemeCountry.memename) == func.lower(new_memename),
-            MemeCountry.country_id != country.country_id
-        )
-    )
+    # Создаем папку для флагов если её нет
+    flags_dir = Path("assets/flags")
+    flags_dir.mkdir(parents=True, exist_ok=True)
     
-    if existing:
-        return False, f"Мемное имя '{new_memename}' уже используется другой страной."
+    # Генерируем имя файла
+    file_extension = "jpg"  # можно определить по mime_type
+    filename = f"flag_{country.country_id}.{file_extension}"
+    save_path = flags_dir / filename
     
-    country.memename = new_memename
-    return True, f"Мемное имя страны успешно изменено на '{new_memename}'."
+    # Скачиваем файл
+    if await download_telegram_file(bot, file_id, save_path):
+        # Сохраняем file_id для будущих скачиваний
+        country.flag_file_id = file_id
+        # Сохраняем путь к локальному файлу
+        country.avatar_url = f"assets/flags/{filename}"
+        return True, f"Флаг успешно сохранен: {filename}"
+    else:
+        return False, "Не удалось скачать флаг из Telegram"
